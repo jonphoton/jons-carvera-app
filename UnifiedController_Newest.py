@@ -4740,24 +4740,28 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                     else:
                         lines.append(f"; === PHASE {phase_num}: Rest machining with {tool['diameter']:.2f}mm tool ===")
                         lines.extend(_coaster_gcode_tool_change(tool["tool_number"], tool["rpm"], retract_z))
+                    is_last_tool = (i == len(tools) - 1)
                     for poly in polys:
                         if i == 0:
                             passes = _coaster_pocket_toolpath(poly, tool_r, so_frac)
-                            contour = _coaster_contour_pass(poly, tool_r)
                         else:
                             prev_r = tools[i - 1]["diameter"] / 2.0
                             passes = _coaster_rest_machining_toolpath(poly, prev_r, tool_r, so_frac)
-                            contour = _coaster_contour_pass(poly, tool_r)
                         if passes:
                             lines.extend(_coaster_gcode_pocket_with_stepdown(
                                 passes, inlay_depth, tool["stepdown"],
                                 tool["feedrate"], retract_z, target_t,
                                 tool["diameter"], tool["ramp_feed"]))
-                        if contour:
-                            lines.extend(_coaster_gcode_pocket_with_stepdown(
-                                contour, inlay_depth, tool["stepdown"],
-                                tool["feedrate"], retract_z, target_t,
-                                tool["diameter"], tool["ramp_feed"]))
+                        # Single-tool: pocket raster needs a contour finish.
+                        # Multi-tool: rest machining already includes the
+                        # innermost contour ring, so no separate pass needed.
+                        if is_last_tool and i == 0:
+                            contour = _coaster_contour_pass(poly, tool_r)
+                            if contour:
+                                lines.extend(_coaster_gcode_pocket_with_stepdown(
+                                    contour, inlay_depth, tool["stepdown"],
+                                    tool["feedrate"], retract_z, target_t,
+                                    tool["diameter"], tool["ramp_feed"]))
 
             # Final phase: Contour cut circular coaster outline (last, so
             # the coaster stays attached to the stock during pocketing)
@@ -4847,22 +4851,24 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                         lines.append(f"; === PHASE {phase_num}: Rest machining with {tool['diameter']:.2f}mm tool ===")
                         lines.extend(_coaster_gcode_tool_change(tool["tool_number"], tool["rpm"], retract_z))
 
+                    is_last_tool = (i == len(tools) - 1)
                     if i == 0:
                         passes = _coaster_pocket_toolpath(clearing_area, tool_r, so_frac)
                     else:
                         prev_r = tools[i - 1]["diameter"] / 2.0
                         passes = _coaster_rest_machining_toolpath(clearing_area, prev_r, tool_r, so_frac)
-                    contour_passes = _coaster_contour_pass(clearing_area, tool_r)
                     if passes:
                         lines.extend(_coaster_gcode_pocket_with_stepdown(
                             passes, plug_depth, tool["stepdown"],
                             tool["feedrate"], retract_z, target_t,
                             tool["diameter"], tool["ramp_feed"]))
-                    if contour_passes:
-                        lines.extend(_coaster_gcode_pocket_with_stepdown(
-                            contour_passes, plug_depth, tool["stepdown"],
-                            tool["feedrate"], retract_z, target_t,
-                            tool["diameter"], tool["ramp_feed"]))
+                    if is_last_tool and i == 0:
+                        contour_passes = _coaster_contour_pass(clearing_area, tool_r)
+                        if contour_passes:
+                            lines.extend(_coaster_gcode_pocket_with_stepdown(
+                                contour_passes, plug_depth, tool["stepdown"],
+                                tool["feedrate"], retract_z, target_t,
+                                tool["diameter"], tool["ramp_feed"]))
 
             # Final phase: Contour cut circular plug (last)
             last_phase = 2 + len(tools) if svg_polys else 2
@@ -4990,27 +4996,29 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                     lines.append(f"; === PHASE {phase_num}: Rest machining with {tool['diameter']:.2f}mm tool ===")
                     lines.extend(_coaster_gcode_tool_change(tool["tool_number"], tool["rpm"], retract_z))
 
+                is_last_tool = (i == len(tools) - 1)
+
                 # Coaster inlay pockets
                 if coaster_polys:
                     lines.append(f"; --- Coaster inlay pockets ---")
                     for poly in coaster_polys:
                         if i == 0:
                             passes = _coaster_pocket_toolpath(poly, tool_r, so_frac)
-                            contour = _coaster_contour_pass(poly, tool_r)
                         else:
                             prev_r = tools[i - 1]["diameter"] / 2.0
                             passes = _coaster_rest_machining_toolpath(poly, prev_r, tool_r, so_frac)
-                            contour = _coaster_contour_pass(poly, tool_r)
                         if passes:
                             lines.extend(_coaster_gcode_pocket_with_stepdown(
                                 passes, inlay_depth, tool["stepdown"],
                                 tool["feedrate"], retract_z, coaster_target_t,
                                 tool["diameter"], tool["ramp_feed"]))
-                        if contour:
-                            lines.extend(_coaster_gcode_pocket_with_stepdown(
-                                contour, inlay_depth, tool["stepdown"],
-                                tool["feedrate"], retract_z, coaster_target_t,
-                                tool["diameter"], tool["ramp_feed"]))
+                        if is_last_tool and i == 0:
+                            contour = _coaster_contour_pass(poly, tool_r)
+                            if contour:
+                                lines.extend(_coaster_gcode_pocket_with_stepdown(
+                                    contour, inlay_depth, tool["stepdown"],
+                                    tool["feedrate"], retract_z, coaster_target_t,
+                                    tool["diameter"], tool["ramp_feed"]))
 
                 # Plug clearing around islands
                 if plug_clearing_area is not None:
@@ -5020,17 +5028,18 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                     else:
                         prev_r = tools[i - 1]["diameter"] / 2.0
                         passes = _coaster_rest_machining_toolpath(plug_clearing_area, prev_r, tool_r, so_frac)
-                    contour_passes = _coaster_contour_pass(plug_clearing_area, tool_r)
                     if passes:
                         lines.extend(_coaster_gcode_pocket_with_stepdown(
                             passes, plug_depth, tool["stepdown"],
                             tool["feedrate"], retract_z, plug_target_t,
                             tool["diameter"], tool["ramp_feed"]))
-                    if contour_passes:
-                        lines.extend(_coaster_gcode_pocket_with_stepdown(
-                            contour_passes, plug_depth, tool["stepdown"],
-                            tool["feedrate"], retract_z, plug_target_t,
-                            tool["diameter"], tool["ramp_feed"]))
+                    if is_last_tool and i == 0:
+                        contour_passes = _coaster_contour_pass(plug_clearing_area, tool_r)
+                        if contour_passes:
+                            lines.extend(_coaster_gcode_pocket_with_stepdown(
+                                contour_passes, plug_depth, tool["stepdown"],
+                                tool["feedrate"], retract_z, plug_target_t,
+                                tool["diameter"], tool["ramp_feed"]))
 
             # === Final phase: Contour cuts for both parts ===
             last_phase = 2 + len(tools) if has_detail_ops else 2
