@@ -47,6 +47,13 @@ venv/bin/pip install numpy matplotlib scipy svgpathtools shapely ezdxf hidapi
 venv/bin/python UnifiedController_Newest.py
 ```
 
+## Stock Holder
+
+The `CoasterCutHolder_Double` is a 3D-printable fixture that holds two pieces of 75mm x 75mm stock side by side on the Carvera bed — one for the coaster and one for the inlay plug. The two stock positions are separated by 110mm (center to center), which matches the default horizontal offset for the joint GCode export in the SVG smoother/inlay tab.
+
+- `CoasterCutHolder_Double.f3d` — Fusion 360 source file
+- `CoasterCutHolder_Double.stl` — Ready-to-print STL
+
 ## Configuration
 
 Settings are stored in:
