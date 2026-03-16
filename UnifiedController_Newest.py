@@ -4291,24 +4291,110 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             return _coaster_raster_fill(offset_poly, stepover)
 
         def _coaster_rest_machining_toolpath(polygon, prev_tool_radius, curr_tool_radius, stepover_frac=0.5):
-            """Generate rest machining passes: only where previous tool couldn't reach."""
-            reachable_curr = polygon.buffer(-curr_tool_radius, join_style=2, mitre_limit=2.0)
-            reachable_prev = polygon.buffer(-prev_tool_radius, join_style=2, mitre_limit=2.0)
+            """Generate rest machining passes: contour-parallel rings where
+            previous tool couldn't reach, with raster fallback for remainder.
+
+            Generates rings at offsets from curr_r to prev_r along the original
+            polygon boundary (spaced by stepover to limit engagement).  Areas
+            where rings collapse (narrow concave features) are raster-filled.
+            """
+            curr_r = curr_tool_radius
+            prev_r = prev_tool_radius
+            stepover = curr_r * 2.0 * stepover_frac
+
+            # Check current tool can reach inside polygon
+            reachable_curr = polygon.buffer(-curr_r, join_style=2, mitre_limit=2.0)
             if reachable_curr.is_empty:
                 return []
-            rest_area = reachable_curr.difference(reachable_prev)
+
+            # Compute rest area (for remainder detection later)
+            reachable_prev = polygon.buffer(-prev_r, join_style=2, mitre_limit=2.0)
+            rest_area = reachable_curr.difference(reachable_prev) if not reachable_prev.is_empty else reachable_curr
             if rest_area.is_empty:
                 return []
-            stepover = curr_tool_radius * 2.0 * stepover_frac
-            if rest_area.geom_type == 'MultiPolygon':
-                passes = []
-                for p in rest_area.geoms:
-                    if p.area > 1e-6:
-                        passes.extend(_coaster_raster_fill(p, stepover))
-                return passes
-            elif rest_area.geom_type == 'Polygon':
-                return _coaster_raster_fill(rest_area, stepover)
-            return []
+
+            # --- Ring offsets from curr_r to prev_r ---
+            ring_offsets = []
+            d = curr_r
+            while d <= prev_r + 1e-9:
+                ring_offsets.append(d)
+                d += stepover
+            # Ensure final offset reaches prev_r
+            if ring_offsets and ring_offsets[-1] < prev_r - 1e-6:
+                ring_offsets.append(prev_r)
+            if not ring_offsets:
+                ring_offsets = [curr_r]
+
+            # --- Extract contour rings at each offset ---
+            rings = []
+            for d in ring_offsets:
+                shrunk = polygon.buffer(-d, join_style=2, mitre_limit=2.0)
+                if shrunk.is_empty:
+                    continue
+                geoms = [shrunk] if shrunk.geom_type == 'Polygon' else list(shrunk.geoms)
+                for geom in geoms:
+                    if geom.is_empty or geom.area < 1e-6:
+                        continue
+                    coords = np.array(geom.exterior.coords)
+                    if len(coords) >= 3:
+                        rings.append(coords)
+                    for interior in geom.interiors:
+                        hcoords = np.array(interior.coords)
+                        if len(hcoords) >= 3:
+                            rings.append(hcoords)
+
+            # --- Filter tiny ring fragments ---
+            min_perimeter = stepover * 4.0
+            filtered = []
+            for r in rings:
+                perimeter = np.sum(np.sqrt(np.sum(np.diff(r, axis=0)**2, axis=1)))
+                if perimeter >= min_perimeter:
+                    filtered.append(r)
+            rings = filtered
+
+            # --- Connect rings: rotate each to start near previous endpoint ---
+            for i in range(1, len(rings)):
+                prev_end = rings[i - 1][-1]
+                ring = rings[i]
+                dists = np.sum((ring - prev_end) ** 2, axis=1)
+                nearest = int(np.argmin(dists))
+                if nearest != 0:
+                    open_ring = ring[:-1] if np.linalg.norm(ring[0] - ring[-1]) < 1e-6 else ring
+                    rotated = np.roll(open_ring, -nearest, axis=0)
+                    rings[i] = np.vstack([rotated, rotated[:1]])
+
+            # --- Raster fill any remainder not covered by contour rings ---
+            raster_passes = []
+            min_area = stepover * stepover
+            if rings:
+                ring_lines = [LineString(r) for r in rings if len(r) >= 2]
+                if ring_lines:
+                    ring_coverage = unary_union(ring_lines).buffer(curr_r, join_style=2, mitre_limit=2.0)
+                    remainder = rest_area.difference(ring_coverage)
+                else:
+                    remainder = rest_area
+            else:
+                remainder = rest_area
+
+            # Handle GeometryCollection from difference()
+            if remainder is not None and not remainder.is_empty:
+                if remainder.geom_type == 'GeometryCollection':
+                    poly_geoms = [g for g in remainder.geoms
+                                  if g.geom_type in ('Polygon', 'MultiPolygon')]
+                    remainder = unary_union(poly_geoms) if poly_geoms else None
+
+            if remainder is not None and not remainder.is_empty and remainder.area > min_area:
+                if remainder.geom_type == 'MultiPolygon':
+                    for p in remainder.geoms:
+                        if p.area > min_area:
+                            raster_passes.extend(_coaster_raster_fill(p, stepover))
+                elif remainder.geom_type == 'Polygon':
+                    raster_passes.extend(_coaster_raster_fill(remainder, stepover))
+                # Filter degenerate micro-segments
+                raster_passes = [p for p in raster_passes
+                                 if np.linalg.norm(p[-1] - p[0]) >= stepover]
+
+            return rings + raster_passes
 
         def _coaster_contour_pass(polygon, tool_radius):
             """Generate a contour pass along the pocket boundary at tool_radius offset.
