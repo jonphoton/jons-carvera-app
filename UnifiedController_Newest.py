@@ -4276,7 +4276,9 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
 
         def _coaster_pocket_toolpath(polygon, tool_radius, stepover_frac=0.5):
             """Generate pocket clearing toolpath: offset inward by tool_radius,
-            then contour-parallel fill."""
+            then raster fill.  Raster fill gives complete coverage for complex
+            concave shapes (contour-parallel collapses too quickly on narrow
+            features like dragon legs/horns)."""
             offset_poly = polygon.buffer(-tool_radius, join_style=2, mitre_limit=2.0)
             if offset_poly.is_empty:
                 return []
@@ -4284,9 +4286,9 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             if offset_poly.geom_type == 'MultiPolygon':
                 passes = []
                 for p in offset_poly.geoms:
-                    passes.extend(_coaster_contour_parallel_fill(p, stepover))
+                    passes.extend(_coaster_raster_fill(p, stepover))
                 return passes
-            return _coaster_contour_parallel_fill(offset_poly, stepover)
+            return _coaster_raster_fill(offset_poly, stepover)
 
         def _coaster_rest_machining_toolpath(polygon, prev_tool_radius, curr_tool_radius, stepover_frac=0.5):
             """Generate rest machining passes: only where previous tool couldn't reach."""
@@ -4302,10 +4304,10 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 passes = []
                 for p in rest_area.geoms:
                     if p.area > 1e-6:
-                        passes.extend(_coaster_contour_parallel_fill(p, stepover))
+                        passes.extend(_coaster_raster_fill(p, stepover))
                 return passes
             elif rest_area.geom_type == 'Polygon':
-                return _coaster_contour_parallel_fill(rest_area, stepover)
+                return _coaster_raster_fill(rest_area, stepover)
             return []
 
         def _coaster_contour_pass(polygon, tool_radius):
