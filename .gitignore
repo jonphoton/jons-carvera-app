@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# macOS
+.DS_Store
+
+# Generated GCode
+*.nc
+*.gcode
+
+# Exports
+Exports/
+
+# Backups
+*.zip
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
