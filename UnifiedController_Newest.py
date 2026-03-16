@@ -5265,6 +5265,17 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                             self.tool_vars[i]["ramp_feed"].set(str(int(ff / 3)))
                         except (ValueError, tk.TclError):
                             pass
+            # Restore min ROC slider (UI may not exist yet at init time)
+            if "min_roc" in cfg:
+                try:
+                    roc = float(cfg["min_roc"])
+                    roc = max(self.roc_min, min(self.roc_max, roc))
+                    self.min_roc = roc
+                    if hasattr(self, 'roc_var'):
+                        self.roc_var.set(np.log10(roc))
+                        self.roc_label.config(text=f"{roc:.3f}")
+                except (ValueError, TypeError):
+                    pass
 
         def _save_coaster_settings(self, *_args):
             """Save coaster parameters to config file."""
@@ -5301,6 +5312,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 if "contour_feed" in self.tool_vars[i]:
                     tcfg["contour_feed"] = self.tool_vars[i]["contour_feed"].get()
                 cfg[f"tool_{i}"] = tcfg
+            cfg["min_roc"] = self.min_roc
             try:
                 with open(COASTER_SETTINGS_FILE, 'w') as f:
                     json.dump(cfg, f, indent=2)
@@ -5416,13 +5428,13 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
 
             slider_frame = ttk.LabelFrame(controls_frame, text="Min ROC", padding=5)
             slider_frame.pack(fill=tk.X, pady=5)
-            self.roc_var = tk.DoubleVar(value=1.0)
+            self.roc_var = tk.DoubleVar(value=np.log10(self.min_roc))
             self.roc_scale = ttk.Scale(slider_frame, from_=np.log10(self.roc_min),
                                        to=np.log10(self.roc_max), variable=self.roc_var,
                                        orient=tk.HORIZONTAL, command=self.on_slider_change)
             self.roc_scale.pack(fill=tk.X)
             self.roc_scale.state(['disabled'])
-            self.roc_label = ttk.Label(slider_frame, text="1.000")
+            self.roc_label = ttk.Label(slider_frame, text=f"{self.min_roc:.3f}")
             self.roc_label.pack()
 
             self.export_btn = ttk.Button(controls_frame, text="Export adjusted",
@@ -5596,6 +5608,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             self._timer_id = None
             if self._last_roc is not None and self.filename:
                 self.min_roc = self._last_roc
+                self._save_coaster_settings()
                 self.run_processing()
 
         def run_processing(self):
