@@ -4490,10 +4490,9 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                                                ramp_feed=None, z_top=None):
             """Convert 2D passes to GCode at a fixed Z depth.
 
-            Uses a helical ramp entry for the first pass.  Minimises lifts
-            between subsequent passes: stays at cutting depth when the next
-            pass starts close to the previous pass's end, otherwise
-            traverses above the stock surface.
+            Uses a helical ramp entry for the first pass, then traverses
+            between subsequent passes at a safe height above the stock
+            surface (z_top) to avoid dragging through uncut material.
             """
             if ramp_feed is None:
                 ramp_feed = feedrate / 3.0
@@ -4503,14 +4502,10 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             ramp_radius = tool_diameter * 0.4  # slightly less than tool radius
             # Traverse above the stock surface to avoid gouging uncut material
             traverse_z = (z_top + 1.0) if z_top is not None else retract_z
-            # Max XY distance to stay at cutting depth instead of lifting
-            stay_down_threshold = tool_diameter * 2.0
-            last_xy = None
             for pss in passes_2d:
                 pts = np.asarray(pss)
                 if len(pts) < 2:
                     continue
-                start_x, start_y = pts[0][0], pts[0][1]
                 if not ramp_done:
                     # Helical ramp entry at the midpoint of the first pass
                     lines.append(f"G0 Z{retract_z:.3f}")
@@ -4520,22 +4515,12 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                         ramp_cx, ramp_cy, ramp_radius,
                         ramp_from, z_depth, stepdown, ramp_feed))
                     ramp_done = True
-                    # After ramp, tool is at z_depth — feed directly to pass start
-                    lines.append(f"G1 X{start_x:.4f} Y{start_y:.4f} F{feedrate:.0f}")
-                else:
-                    # Check distance from last position to this pass start
-                    dist = ((start_x - last_xy[0])**2 + (start_y - last_xy[1])**2)**0.5
-                    if dist <= stay_down_threshold:
-                        # Close enough — stay at depth and feed to start
-                        lines.append(f"G1 X{start_x:.4f} Y{start_y:.4f} F{feedrate:.0f}")
-                    else:
-                        # Too far — lift, rapid, plunge
-                        lines.append(f"G0 Z{traverse_z:.3f}")
-                        lines.append(f"G0 X{start_x:.4f} Y{start_y:.4f}")
-                        lines.append(f"G1 Z{z_depth:.3f} F{ramp_feed:.0f}")
+                # Lift to shallow clearance, rapid to pass start, plunge
+                lines.append(f"G0 Z{traverse_z:.3f}")
+                lines.append(f"G0 X{pts[0][0]:.4f} Y{pts[0][1]:.4f}")
+                lines.append(f"G1 Z{z_depth:.3f} F{ramp_feed:.0f}")
                 for pt in pts[1:]:
                     lines.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} F{feedrate:.0f}")
-                last_xy = (pts[-1][0], pts[-1][1])
             return lines
 
         def _coaster_gcode_surface_at_depth(passes_2d, z_depth, feedrate, retract_z,
