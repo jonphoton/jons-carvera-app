@@ -4184,7 +4184,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             Returns a list of numpy arrays, each (N,2), representing
             continuous cutting passes.
             """
-            if polygon.is_empty or polygon.area < 1e-6:
+            if polygon.is_empty or polygon.area < stepover * stepover:
                 return []
             bounds = polygon.bounds  # (minx, miny, maxx, maxy)
             passes = []
@@ -4200,8 +4200,8 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                         segs = [clipped]
                     elif clipped.geom_type == 'MultiLineString':
                         segs = list(clipped.geoms)
-                    # Sort segments left-to-right or right-to-left
-                    segs = [s for s in segs if s.length > 0.01]
+                    # Filter short segments (slivers from buffer artifacts)
+                    segs = [s for s in segs if s.length > stepover * 0.5]
                     segs.sort(key=lambda s: s.bounds[0], reverse=(direction < 0))
                     for seg in segs:
                         coords = list(seg.coords)
@@ -4283,9 +4283,13 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             if offset_poly.is_empty:
                 return []
             stepover = tool_radius * 2.0 * stepover_frac
+            # Minimum area to filter sliver artifacts from buffer on complex shapes
+            min_area = stepover * stepover
             if offset_poly.geom_type == 'MultiPolygon':
                 passes = []
                 for p in offset_poly.geoms:
+                    if p.area < min_area:
+                        continue
                     passes.extend(_coaster_raster_fill(p, stepover))
                 return passes
             return _coaster_raster_fill(offset_poly, stepover)
@@ -4326,6 +4330,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 ring_offsets = [curr_r]
 
             # --- Extract contour rings at each offset ---
+            min_area = stepover * stepover
             rings = []
             for d in ring_offsets:
                 shrunk = polygon.buffer(-d, join_style=2, mitre_limit=2.0)
@@ -4333,7 +4338,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                     continue
                 geoms = [shrunk] if shrunk.geom_type == 'Polygon' else list(shrunk.geoms)
                 for geom in geoms:
-                    if geom.is_empty or geom.area < 1e-6:
+                    if geom.is_empty or geom.area < min_area:
                         continue
                     coords = np.array(geom.exterior.coords)
                     if len(coords) >= 3:
@@ -4400,23 +4405,33 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             """Generate a contour pass along the pocket boundary at tool_radius offset.
 
             Returns a list of numpy arrays representing the contour path(s).
+            Filters out sliver artifacts from buffer operations on complex shapes.
             """
             offset_poly = polygon.buffer(-tool_radius, join_style=2, mitre_limit=2.0)
             if offset_poly.is_empty:
                 return []
             passes = []
+            # Minimum area/perimeter to skip sliver artifacts
+            min_area = tool_radius * tool_radius
+            min_perim = tool_radius * 4.0
             if offset_poly.geom_type == 'MultiPolygon':
                 polys = list(offset_poly.geoms)
             else:
                 polys = [offset_poly]
             for p in polys:
+                if p.area < min_area:
+                    continue
                 coords = np.array(p.exterior.coords)
                 if len(coords) > 1:
                     passes.append(coords)
                 for hole in p.interiors:
                     hcoords = np.array(hole.coords)
-                    if len(hcoords) > 1:
-                        passes.append(hcoords)
+                    if len(hcoords) < 3:
+                        continue
+                    perim = np.sum(np.sqrt(np.sum(np.diff(hcoords, axis=0)**2, axis=1)))
+                    if perim < min_perim:
+                        continue
+                    passes.append(hcoords)
             return passes
 
         # ----- GCode emission helpers -----
@@ -4489,12 +4504,19 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
 
         def _coaster_gcode_raster_at_depth(passes_2d, z_depth, feedrate, retract_z,
                                                stepdown, tool_diameter, prev_z=None,
-                                               ramp_feed=None, z_top=None):
+                                               ramp_feed=None, z_top=None,
+                                               ramp_on_path=False):
             """Convert 2D passes to GCode at a fixed Z depth.
 
             Uses a helical ramp entry for the first pass, then traverses
             between subsequent passes at a safe height above the stock
             surface (z_top) to avoid dragging through uncut material.
+
+            If ramp_on_path=True, the first pass descends gradually along
+            the path itself instead of using a separate helical/linear ramp.
+            Use this for contour-only operations (like clearance passes)
+            where there is no prior clearing and a separate ramp would cut
+            through unintended material.
             """
             if ramp_feed is None:
                 ramp_feed = feedrate / 3.0
@@ -4502,11 +4524,38 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             ramp_from = prev_z if prev_z is not None else retract_z
             ramp_done = False
             ramp_radius = tool_diameter * 0.4  # slightly less than tool radius
+            # Auto-enable ramp_on_path for small tools that would hit the
+            # linear ramp fallback — the linear ramp extends 6mm in +X from
+            # the path midpoint, which can cut through unintended areas
+            if ramp_radius < 0.3:
+                ramp_on_path = True
             # Traverse above the stock surface to avoid gouging uncut material
             traverse_z = (z_top + 1.0) if z_top is not None else retract_z
             for pss in passes_2d:
                 pts = np.asarray(pss)
                 if len(pts) < 2:
+                    continue
+                if not ramp_done and ramp_on_path:
+                    # Ramp along the path: descend gradually while following
+                    # the path instead of a separate helical/linear ramp
+                    lines.append(f"G0 Z{retract_z:.3f}")
+                    lines.append(f"G0 X{pts[0][0]:.4f} Y{pts[0][1]:.4f}")
+                    lines.append(f"G0 Z{ramp_from + 0.3:.3f}")
+                    # Compute cumulative distance along path for smooth descent
+                    diffs = np.sqrt(np.sum(np.diff(pts, axis=0)**2, axis=1))
+                    cum_dist = np.concatenate(([0.0], np.cumsum(diffs)))
+                    total_dist = cum_dist[-1]
+                    z_drop = ramp_from - z_depth
+                    # Ramp over at most 1/4 of the path length
+                    ramp_dist = min(total_dist * 0.25, max(2.0, z_drop * 3.0))
+                    for j in range(len(pts)):
+                        if cum_dist[j] < ramp_dist:
+                            frac = cum_dist[j] / ramp_dist if ramp_dist > 0 else 1.0
+                            z = ramp_from - frac * z_drop
+                            lines.append(f"G1 X{pts[j][0]:.4f} Y{pts[j][1]:.4f} Z{z:.3f} F{ramp_feed:.0f}")
+                        else:
+                            lines.append(f"G1 X{pts[j][0]:.4f} Y{pts[j][1]:.4f} F{feedrate:.0f}")
+                    ramp_done = True
                     continue
                 if not ramp_done:
                     # Helical ramp entry at the midpoint of the first pass
@@ -5115,12 +5164,15 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                         continue
                     lines.append(f"")
                     lines.append(f"; --- Feature {pi + 1}: clearance contour (2 laps) ---")
-                    # Two laps at full depth for tool deflection
+                    # Two laps at full depth for tool deflection.
+                    # Use ramp_on_path so the tool descends along the contour
+                    # instead of a separate ramp that could cut through the feature.
                     double_contour = contour + contour
                     lines.extend(_coaster_gcode_raster_at_depth(
                         double_contour, z_bottom, smallest["feedrate"],
                         retract_z, inlay_depth, smallest["diameter"],
-                        target_t, smallest["ramp_feed"], target_t))
+                        target_t, smallest["ramp_feed"], target_t,
+                        ramp_on_path=True))
 
             lines.append("")
             lines.extend(_coaster_gcode_footer(retract_z))
