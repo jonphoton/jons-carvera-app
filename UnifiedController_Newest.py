@@ -4802,11 +4802,13 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             retract_z = plug_t + params["retract_z"]
             coaster_r = params["coaster_diameter"] / 2.0
 
-            # Re-transform paths to plug stock coordinates
+            # Re-transform paths to plug stock coordinates, mirrored in X
+            # so the plug matches the coaster when flipped upside down
             plug_paths, plug_center = _coaster_svg_to_machine(
                 params["fitted_paths"], params["coaster_diameter"], plug_w, plug_h)
-
             cx, cy = plug_center
+            for p in plug_paths:
+                p[:, 0] = 2.0 * cx - p[:, 0]
 
             plug_depth = inlay_depth + glue_gap  # plug features taller than coaster pockets for glue space
 
@@ -4920,12 +4922,15 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             plug_h = params["plug_stock_h"]
             plug_t = params["plug_stock_thickness"]
 
-            # Transform plug paths to plug stock coords, then apply X offset
+            # Transform plug paths to plug stock coords, mirror in X
+            # so the plug matches the coaster when flipped, then apply X offset
             plug_paths_raw, plug_center_raw = _coaster_svg_to_machine(
                 params["fitted_paths"], params["coaster_diameter"], plug_w, plug_h)
+            plug_cx_raw = plug_center_raw[0]
             plug_paths = []
             for path in plug_paths_raw:
                 offset_path = path.copy()
+                offset_path[:, 0] = 2.0 * plug_cx_raw - offset_path[:, 0]
                 offset_path[:, 0] += x_offset
                 plug_paths.append(offset_path)
             plug_cx = plug_center_raw[0] + x_offset
