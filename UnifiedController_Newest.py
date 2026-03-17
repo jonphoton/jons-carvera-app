@@ -4462,8 +4462,10 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             """
             lines = []
             if ramp_radius < 0.3:
-                # Too small for a helix — do a short linear ramp
+                # Too small for a helix — position first, then linear ramp
                 ramp_len = max(2.0, abs(z_from - z_to) * 3.0)
+                lines.append(f"G0 X{cx:.4f} Y{cy:.4f}")
+                lines.append(f"G0 Z{z_from + 0.3:.3f}")
                 lines.append(f"G1 X{cx + ramp_len:.4f} Y{cy:.4f} Z{z_to:.3f} F{ramp_feed:.0f}")
                 lines.append(f"G1 X{cx:.4f} Y{cy:.4f} F{ramp_feed:.0f}")
                 return lines
