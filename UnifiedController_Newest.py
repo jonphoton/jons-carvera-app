@@ -87,6 +87,17 @@ except ImportError:
     print("Warning: shapely not installed. Coaster GCode generation will be disabled.")
     print("  Install with: pip install shapely")
 
+# GCode simulator engine (for visualization tab)
+try:
+    from gcode_simulator import (
+        parse_gcode as sim_parse_gcode, parse_gcode_header as sim_parse_header,
+        run_simulation as sim_run, ToolDef as SimToolDef,
+        Segment as SimSegment, DEFAULT_TOOLS as SIM_DEFAULT_TOOLS
+    )
+    HAS_GCODE_SIM = True
+except ImportError:
+    HAS_GCODE_SIM = False
+
 
 # =============================================================================
 # Data Classes and Enums
@@ -4274,6 +4285,27 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             stepover = tool_diameter * stepover_frac
             return _coaster_raster_fill(circle, stepover)
 
+        def _coaster_filter_small_fragments(geom, min_frac=0.1):
+            """Remove small disconnected polygon fragments from a MultiPolygon.
+            Keeps only parts with area >= min_frac of the largest part's area.
+            This prevents isolated gouge marks at narrow feature tips (e.g.
+            wing tips, feet) where the tool can barely reach."""
+            if geom is None or geom.is_empty:
+                return geom
+            if geom.geom_type != 'MultiPolygon':
+                return geom
+            parts = list(geom.geoms)
+            if len(parts) <= 1:
+                return geom
+            max_area = max(p.area for p in parts)
+            threshold = max_area * min_frac
+            kept = [p for p in parts if p.area >= threshold]
+            if not kept:
+                return geom
+            if len(kept) == 1:
+                return kept[0]
+            return MultiPolygon(kept)
+
         def _coaster_pocket_toolpath(polygon, tool_radius, stepover_frac=0.5):
             """Generate pocket clearing toolpath: offset inward by tool_radius,
             then raster fill.  Raster fill gives complete coverage for complex
@@ -4282,8 +4314,12 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             offset_poly = polygon.buffer(-tool_radius, join_style=2, mitre_limit=2.0)
             if offset_poly.is_empty:
                 return []
+            # Filter small disconnected fragments at narrow feature tips —
+            # these get handled by the smaller finishing tool instead
+            offset_poly = _coaster_filter_small_fragments(offset_poly)
+            if offset_poly is None or offset_poly.is_empty:
+                return []
             stepover = tool_radius * 2.0 * stepover_frac
-            # Minimum area to filter sliver artifacts from buffer on complex shapes
             min_area = stepover * stepover
             if offset_poly.geom_type == 'MultiPolygon':
                 passes = []
@@ -4312,8 +4348,11 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 return []
 
             # Compute rest area (for remainder detection later)
+            # Filter small fragments from reachable_prev to match what the
+            # previous tool actually machined (it skips narrow feature tips)
             reachable_prev = polygon.buffer(-prev_r, join_style=2, mitre_limit=2.0)
-            rest_area = reachable_curr.difference(reachable_prev) if not reachable_prev.is_empty else reachable_curr
+            reachable_prev = _coaster_filter_small_fragments(reachable_prev)
+            rest_area = reachable_curr.difference(reachable_prev) if (reachable_prev is not None and not reachable_prev.is_empty) else reachable_curr
             if rest_area.is_empty:
                 return []
 
@@ -4524,11 +4563,23 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             ramp_from = prev_z if prev_z is not None else retract_z
             ramp_done = False
             ramp_radius = tool_diameter * 0.4  # slightly less than tool radius
+            tool_r = tool_diameter / 2.0
             # Auto-enable ramp_on_path for small tools that would hit the
             # linear ramp fallback — the linear ramp extends 6mm in +X from
             # the path midpoint, which can cut through unintended areas
             if ramp_radius < 0.3:
                 ramp_on_path = True
+            # Auto-enable ramp_on_path when the first pass is too short for
+            # the helical ramp circle to fit.  The ramp sweeps a circle of
+            # radius (ramp_radius + tool_r) around the midpoint.  If the pass
+            # is shorter than the ramp diameter, the ramp circle extends
+            # beyond the pocket boundary at narrow features (dragon feet etc.)
+            if not ramp_on_path and passes_2d:
+                first_pts = np.asarray(passes_2d[0])
+                if len(first_pts) >= 2:
+                    first_len = np.linalg.norm(first_pts[-1] - first_pts[0])
+                    if first_len < 2 * (ramp_radius + tool_r):
+                        ramp_on_path = True
             # Traverse above the stock surface to avoid gouging uncut material
             traverse_z = (z_top + 1.0) if z_top is not None else retract_z
             for pss in passes_2d:
@@ -4761,8 +4812,10 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 f"; Origin: lower-left corner of stock, Z=0 at stock bottom",
                 f"; Stock top: Z={stock_t:.1f}, Surfaced top: Z={target_t:.1f}",
                 f"; Inlay bottom: Z={target_t - inlay_depth:.1f}",
-                "",
             ]
+            for t in tools:
+                lines.append(f"; Tool T{t['tool_number']}: {t['diameter']:.3f}mm dia")
+            lines.append("")
             lines.extend(_coaster_gcode_header(largest["rpm"], largest["tool_number"]))
 
             # Phase 1: Surface coaster area to target thickness
@@ -4868,8 +4921,10 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 f"; Plug target thickness: {target_t:.1f} mm",
                 f"; Plug clearing depth: {plug_depth:.1f} mm (inlay {inlay_depth:.1f} + glue gap {glue_gap:.2f})",
                 f"; Origin: lower-left corner of stock, Z=0 at stock bottom",
-                "",
             ]
+            for t in tools:
+                lines.append(f"; Tool T{t['tool_number']}: {t['diameter']:.3f}mm dia")
+            lines.append("")
             lines.extend(_coaster_gcode_header(largest["rpm"], largest["tool_number"]))
 
             # Phase 1: Surface plug stock to target thickness
@@ -4997,8 +5052,10 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 f"; Inlay depth: {inlay_depth:.1f} mm, Plug clearing depth: {plug_depth:.1f} mm (glue gap {glue_gap:.2f})",
                 f"; Origin: lower-left corner of coaster stock, Z=0 at stock bottom",
                 f"; Plug lower-left at X={x_offset:.1f}",
-                "",
             ]
+            for t in tools:
+                lines.append(f"; Tool T{t['tool_number']}: {t['diameter']:.3f}mm dia")
+            lines.append("")
             lines.extend(_coaster_gcode_header(largest["rpm"], largest["tool_number"]))
 
             # === Phase 1: Surface both parts with largest tool ===
@@ -5178,6 +5235,139 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             lines.extend(_coaster_gcode_footer(retract_z))
             return "\n".join(lines)
 
+        def _coaster_outward_spiral(cx, cy, max_radius, stepover, seg_len=0.5):
+            """Generate an Archimedean spiral from center outward.
+
+            Returns a numpy array (N,2) of points tracing a spiral from
+            (cx, cy) outward to max_radius with spacing = stepover per
+            revolution.  seg_len controls the maximum chord length between
+            consecutive points.
+            """
+            # r = stepover * theta / (2*pi)
+            # theta_max = 2*pi * max_radius / stepover
+            if max_radius <= 0 or stepover <= 0:
+                return np.array([[cx, cy]])
+            theta_max = 2.0 * math.pi * max_radius / stepover
+            points = [(cx, cy)]
+            theta = 0.0
+            while theta < theta_max:
+                r = stepover * theta / (2.0 * math.pi)
+                # Adaptive step: smaller dtheta at larger radii for smooth arcs
+                if r < 0.1:
+                    dtheta = 0.5  # coarse near center where r is tiny
+                else:
+                    dtheta = seg_len / r
+                theta += dtheta
+                if theta > theta_max:
+                    theta = theta_max
+                r = stepover * theta / (2.0 * math.pi)
+                points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+            return np.array(points)
+
+        def _coaster_generate_plug_clearance_gcode(params):
+            """Generate plug clearance pass GCode.
+
+            After glue-up, surfaces off the excess plug material protruding
+            above the coaster.  Uses the roughing tool with outward spiral
+            passes from the coaster center, stepping down to a final height
+            with the last two passes at a finer stepdown for a clean finish.
+            """
+            tools = sorted(params["tools"], key=lambda t: -t["diameter"])
+            roughing = tools[0]
+            tool_r = roughing["diameter"] / 2.0
+            so_frac = roughing.get("stepover_frac", 0.5)
+            stepover = roughing["diameter"] * so_frac
+
+            stock_t = params["stock_thickness"]
+            target_t = params["target_thickness"]
+            plug_target_t = params["plug_target_thickness"]
+            inlay_depth = params["inlay_depth"]
+            coaster_top_removal = params["coaster_top_removal"]
+            final_pass_depth = params["final_pass_depth"]
+            retract_z = stock_t + params["retract_z"]
+
+            cx = params["stock_w"] / 2.0
+            cy = params["stock_h"] / 2.0
+            coaster_r = params["coaster_diameter"] / 2.0
+            max_radius = coaster_r + tool_r
+
+            # Z levels
+            z_start = target_t + plug_target_t - inlay_depth
+            z_final = target_t - coaster_top_removal
+            total_removal = z_start - z_final
+
+            if total_removal <= 0:
+                return "; Nothing to remove — plug does not protrude above final surface\n"
+
+            lines = [
+                f"; Plug Clearance Pass GCode",
+                f"; Tool: {roughing['diameter']:.2f} mm (tool #{roughing['tool_number']})",
+                f"; Start Z: {z_start:.3f} (plug top after glue-up)",
+                f"; Final Z: {z_final:.3f} (coaster target {target_t:.1f} - top removal {coaster_top_removal:.2f})",
+                f"; Total removal: {total_removal:.3f} mm",
+                f"; Roughing stepdown: {roughing['stepdown']:.2f} mm",
+                f"; Final two pass depth: {final_pass_depth:.3f} mm each",
+                f"; Spiral radius: {max_radius:.2f} mm (coaster {coaster_r:.1f} + tool {tool_r:.3f})",
+                f"; Stepover: {stepover:.3f} mm ({so_frac*100:.0f}%)",
+                f"; Origin: lower-left corner of stock, Z=0 at stock bottom",
+                "",
+            ]
+            lines.extend(_coaster_gcode_header(roughing["rpm"], roughing["tool_number"]))
+
+            # Generate 2D outward spiral (reused for every depth layer)
+            spiral = _coaster_outward_spiral(cx, cy, max_radius, stepover)
+
+            # Compute depth layers: roughing passes, then final two at fine stepdown
+            z_layers = []
+            z = z_start
+            z_before_final = z_final + 2.0 * final_pass_depth
+            stepdown = roughing["stepdown"]
+
+            while z > z_before_final + 1e-6:
+                z -= stepdown
+                if z < z_before_final:
+                    z = z_before_final
+                z_layers.append(z)
+
+            z_layers.append(z_final + final_pass_depth)
+            z_layers.append(z_final)
+
+            # Remove duplicates
+            cleaned = []
+            for zl in z_layers:
+                if not cleaned or abs(zl - cleaned[-1]) > 1e-6:
+                    cleaned.append(zl)
+            z_layers = cleaned
+
+            ramp_radius = roughing["diameter"] * 0.4
+            ramp_feed = roughing["ramp_feed"]
+            feedrate = roughing["feedrate"]
+            prev_z = z_start
+
+            for i, z in enumerate(z_layers):
+                is_final = (i >= len(z_layers) - 2)
+                label = "final pass" if is_final else "roughing pass"
+                lines.append("")
+                lines.append(f"; {label} Z={z:.3f}")
+
+                # Helical ramp at center to reach depth
+                lines.append(f"G0 Z{retract_z:.3f}")
+                lines.extend(_coaster_gcode_helical_ramp(
+                    cx, cy, ramp_radius,
+                    prev_z, z, stepdown, ramp_feed))
+
+                # Spiral outward from center at cutting depth
+                for pt in spiral:
+                    lines.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} F{feedrate:.0f}")
+
+                # Retract
+                lines.append(f"G0 Z{retract_z:.3f}")
+                prev_z = z
+
+            lines.append("")
+            lines.extend(_coaster_gcode_footer(retract_z))
+            return "\n".join(lines)
+
     class SVGSmootherTab(ttk.Frame):
         """Tab for SVG curve smoothing with ROC constraints and coaster GCode generation."""
 
@@ -5185,6 +5375,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             super().__init__(parent)
 
             self.filename = None
+            self._last_saved_gcode = None
             self.results = None
             self.min_roc = 1.0
             self.roc_min = 0.1
@@ -5232,6 +5423,8 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             self.retract_height_var = tk.StringVar(value=str(COASTER_DEFAULT_RETRACT))
             self.joint_horiz_offset_var = tk.StringVar(value="120.0")
             self.clearance_offset_var = tk.StringVar(value="0.1")
+            self.coaster_top_removal_var = tk.StringVar(value="0.5")
+            self.final_pass_depth_var = tk.StringVar(value="0.1")
 
             self.tool_vars = []
             for i, defaults in enumerate(COASTER_DEFAULT_TOOLS):
@@ -5277,6 +5470,8 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 ("retract_height", self.retract_height_var),
                 ("joint_horiz_offset", self.joint_horiz_offset_var),
                 ("clearance_offset", self.clearance_offset_var),
+                ("coaster_top_removal", self.coaster_top_removal_var),
+                ("final_pass_depth", self.final_pass_depth_var),
             ]:
                 if key in cfg:
                     var.set(str(cfg[key]))
@@ -5340,6 +5535,8 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 ("retract_height", self.retract_height_var),
                 ("joint_horiz_offset", self.joint_horiz_offset_var),
                 ("clearance_offset", self.clearance_offset_var),
+                ("coaster_top_removal", self.coaster_top_removal_var),
+                ("final_pass_depth", self.final_pass_depth_var),
             ]:
                 cfg[key] = var.get()
             for i in range(3):
@@ -5571,11 +5768,39 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             clearance_entry.bind("<Return>", self._on_param_change)
             ttk.Label(clearance_row, text="mm").pack(side=tk.LEFT)
 
+            # Plug clearance pass section
+            ttk.Separator(controls_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+            self.gen_plug_clearance_btn = ttk.Button(controls_frame,
+                text="Generate Plug Clearance Passes",
+                command=self.generate_plug_clearance_gcode)
+            self.gen_plug_clearance_btn.pack(fill=tk.X, pady=3)
+            top_removal_row = ttk.Frame(controls_frame)
+            top_removal_row.pack(fill=tk.X, pady=1)
+            ttk.Label(top_removal_row, text="Coaster Top Removal:",
+                      anchor=tk.W).pack(side=tk.LEFT)
+            top_removal_entry = ttk.Entry(top_removal_row,
+                                          textvariable=self.coaster_top_removal_var, width=6)
+            top_removal_entry.pack(side=tk.LEFT, padx=2)
+            top_removal_entry.bind("<FocusOut>", self._on_param_change)
+            top_removal_entry.bind("<Return>", self._on_param_change)
+            ttk.Label(top_removal_row, text="mm").pack(side=tk.LEFT)
+            final_pass_row = ttk.Frame(controls_frame)
+            final_pass_row.pack(fill=tk.X, pady=1)
+            ttk.Label(final_pass_row, text="Final Two Pass Depths:",
+                      anchor=tk.W).pack(side=tk.LEFT)
+            final_pass_entry = ttk.Entry(final_pass_row,
+                                         textvariable=self.final_pass_depth_var, width=6)
+            final_pass_entry.pack(side=tk.LEFT, padx=2)
+            final_pass_entry.bind("<FocusOut>", self._on_param_change)
+            final_pass_entry.bind("<Return>", self._on_param_change)
+            ttk.Label(final_pass_row, text="mm").pack(side=tk.LEFT)
+
             if not gcode_enabled:
                 self.gen_coaster_btn.config(state=tk.DISABLED)
                 self.gen_plug_btn.config(state=tk.DISABLED)
                 self.gen_joint_btn.config(state=tk.DISABLED)
                 self.gen_clearance_btn.config(state=tk.DISABLED)
+                self.gen_plug_clearance_btn.config(state=tk.DISABLED)
                 ttk.Label(controls_frame, text="Install shapely for GCode",
                           foreground="red").pack(fill=tk.X)
 
@@ -6196,6 +6421,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 f.write(gcode)
             n_lines = gcode.count('\n') + 1
             self.gcode_status.config(text=f"Coaster GCode saved: {n_lines} lines")
+            self._last_saved_gcode = outfile
             messagebox.showinfo("GCode Saved", f"Coaster GCode saved to:\n{outfile}")
 
         def generate_plug_gcode(self):
@@ -6242,6 +6468,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 f.write(gcode)
             n_lines = gcode.count('\n') + 1
             self.gcode_status.config(text=f"Plug GCode saved: {n_lines} lines")
+            self._last_saved_gcode = outfile
             messagebox.showinfo("GCode Saved", f"Plug GCode saved to:\n{outfile}")
 
         def generate_joint_gcode(self):
@@ -6307,6 +6534,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 f.write(gcode)
             n_lines = gcode.count('\n') + 1
             self.gcode_status.config(text=f"Joint GCode saved: {n_lines} lines")
+            self._last_saved_gcode = outfile
             messagebox.showinfo("GCode Saved", f"Joint GCode saved to:\n{outfile}")
 
         def generate_clearance_gcode(self):
@@ -6369,7 +6597,562 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 f.write(gcode)
             n_lines = gcode.count('\n') + 1
             self.gcode_status.config(text=f"Clearance GCode saved: {n_lines} lines")
+            self._last_saved_gcode = outfile
             messagebox.showinfo("GCode Saved", f"Clearance pass GCode saved to:\n{outfile}")
+
+        def generate_plug_clearance_gcode(self):
+            """Button handler: generate and save plug clearance pass GCode."""
+            try:
+                params = self._collect_params()
+            except ValueError as e:
+                messagebox.showerror("Invalid Parameters", str(e))
+                return
+            ok, err = self._validate_params(params)
+            if not ok:
+                messagebox.showerror("Validation Error", err)
+                return
+
+            # Parse plug clearance settings
+            try:
+                coaster_top_removal = float(self.coaster_top_removal_var.get())
+                if coaster_top_removal < 0:
+                    raise ValueError("must be non-negative")
+            except (ValueError, tk.TclError):
+                messagebox.showerror("Invalid Parameters",
+                    f"Invalid coaster top removal: '{self.coaster_top_removal_var.get()}'")
+                return
+            try:
+                final_pass_depth = float(self.final_pass_depth_var.get())
+                if final_pass_depth <= 0:
+                    raise ValueError("must be positive")
+            except (ValueError, tk.TclError):
+                messagebox.showerror("Invalid Parameters",
+                    f"Invalid final pass depth: '{self.final_pass_depth_var.get()}'")
+                return
+            params["coaster_top_removal"] = coaster_top_removal
+            params["final_pass_depth"] = final_pass_depth
+
+            try:
+                gcode = _coaster_generate_plug_clearance_gcode(params)
+            except Exception as e:
+                messagebox.showerror("GCode Error", f"Failed to generate GCode:\n{e}")
+                return
+
+            default_name = ""
+            if self.filename:
+                base = os.path.splitext(os.path.basename(self.filename))[0]
+                default_name = f"{base}_plug_clearance.nc"
+            outfile = filedialog.asksaveasfilename(
+                title="Save Plug Clearance Pass GCode",
+                defaultextension=".nc",
+                initialfile=default_name,
+                filetypes=[("GCode files", "*.nc *.gcode"), ("All files", "*.*")]
+            )
+            if not outfile:
+                return
+            with open(outfile, 'w') as f:
+                f.write(gcode)
+            n_lines = gcode.count('\n') + 1
+            self.gcode_status.config(text=f"Plug clearance GCode saved: {n_lines} lines")
+            self._last_saved_gcode = outfile
+            messagebox.showinfo("GCode Saved", f"Plug clearance pass GCode saved to:\n{outfile}")
+
+
+# =============================================================================
+# GCode Simulator Tab
+# =============================================================================
+
+if HAS_GCODE_SIM and HAS_MATPLOTLIB:
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.collections import LineCollection as SimLineCollection
+
+    _WOOD_CMAP = LinearSegmentedColormap.from_list('wood', [
+        (0.08, 0.08, 0.10),   # cut through — near-black
+        (0.25, 0.18, 0.09),   # deep cut — dark walnut
+        (0.45, 0.30, 0.15),   # mid depth — medium oak
+        (0.65, 0.46, 0.22),   # shallow cut — light wood
+        (0.80, 0.60, 0.30),   # uncut surface — pale maple
+    ], N=256)
+
+    # Distinct colors per tool for toolpath view
+    _TOOL_COLORS = {
+        3: (0.20, 0.60, 1.00, 0.7),
+        5: (1.00, 0.40, 0.10, 0.7),
+        6: (0.10, 0.90, 0.30, 0.7),
+    }
+
+    class GCodeSimulatorTab(ttk.Frame):
+        """Tab for GCode toolpath visualization and material removal simulation."""
+
+        def __init__(self, parent, svg_smoother_tab=None):
+            super().__init__(parent)
+            self.svg_smoother_tab = svg_smoother_tab
+
+            # State
+            self.raw_lines = None
+            self.segments = None
+            self.heightmap = None
+            self.loaded_file = None
+            self.stock_dims = None      # (w, h, t)
+            self.tool_defs = {}         # {tool_num: SimToolDef}
+            self.tools_used = set()
+            self._sim_thread = None
+            self._sim_cancel = False
+            self._colorbar = None
+            self._hm_image = None       # imshow artist for in-place updates
+            self._checkpoints = []      # [(seg_idx, heightmap_copy), ...]
+            self._slider_updating = False
+
+            self._setup_ui()
+
+        def _setup_ui(self):
+            # Main horizontal split: controls left, plots right
+            paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+            paned.pack(fill=tk.BOTH, expand=True)
+
+            # --- Left panel (controls) ---
+            left_frame = ttk.Frame(paned, width=280)
+            paned.add(left_frame, weight=0)
+
+            # Scrollable controls
+            ctrl_canvas = tk.Canvas(left_frame, width=270, highlightthickness=0)
+            ctrl_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL,
+                                        command=ctrl_canvas.yview)
+            ctrl_inner = ttk.Frame(ctrl_canvas)
+            ctrl_inner.bind("<Configure>",
+                lambda e: ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox("all")))
+            ctrl_canvas.create_window((0, 0), window=ctrl_inner, anchor="nw")
+            ctrl_canvas.configure(yscrollcommand=ctrl_scroll.set)
+            ctrl_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            ctrl_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            # -- GCode File section --
+            file_frame = ttk.LabelFrame(ctrl_inner, text="GCode File", padding=5)
+            file_frame.pack(fill=tk.X, padx=5, pady=3)
+
+            btn_row = ttk.Frame(file_frame)
+            btn_row.pack(fill=tk.X)
+            ttk.Button(btn_row, text="Load GCode...",
+                       command=self.load_gcode).pack(side=tk.LEFT, padx=2)
+            ttk.Button(btn_row, text="Last Export",
+                       command=self.load_last_export).pack(side=tk.LEFT, padx=2)
+
+            self._file_label = ttk.Label(file_frame, text="No file loaded",
+                                          wraplength=250)
+            self._file_label.pack(fill=tk.X, pady=2)
+            self._info_label = ttk.Label(file_frame, text="")
+            self._info_label.pack(fill=tk.X)
+
+            # -- Stock Dimensions section --
+            stock_frame = ttk.LabelFrame(ctrl_inner, text="Stock Dimensions (mm)",
+                                          padding=5)
+            stock_frame.pack(fill=tk.X, padx=5, pady=3)
+
+            self._stock_w_var = tk.StringVar(value="75.0")
+            self._stock_h_var = tk.StringVar(value="75.0")
+            self._stock_t_var = tk.StringVar(value="16.0")
+
+            for label, var in [("Width:", self._stock_w_var),
+                               ("Height:", self._stock_h_var),
+                               ("Thickness:", self._stock_t_var)]:
+                row = ttk.Frame(stock_frame)
+                row.pack(fill=tk.X, pady=1)
+                ttk.Label(row, text=label, width=10).pack(side=tk.LEFT)
+                ttk.Entry(row, textvariable=var, width=10).pack(side=tk.LEFT)
+
+            # -- Tools section --
+            self._tools_frame = ttk.LabelFrame(ctrl_inner, text="Tools", padding=5)
+            self._tools_frame.pack(fill=tk.X, padx=5, pady=3)
+            self._tools_label = ttk.Label(self._tools_frame,
+                                           text="Load GCode to see tools")
+            self._tools_label.pack(fill=tk.X)
+
+            # -- Simulation section --
+            sim_frame = ttk.LabelFrame(ctrl_inner, text="Simulation", padding=5)
+            sim_frame.pack(fill=tk.X, padx=5, pady=3)
+
+            res_row = ttk.Frame(sim_frame)
+            res_row.pack(fill=tk.X, pady=1)
+            ttk.Label(res_row, text="Resolution:", width=10).pack(side=tk.LEFT)
+            self._res_var = tk.StringVar(value="0.05")
+            ttk.Entry(res_row, textvariable=self._res_var, width=10).pack(
+                side=tk.LEFT)
+            ttk.Label(res_row, text="mm/px").pack(side=tk.LEFT, padx=3)
+
+            self._sim_btn = ttk.Button(sim_frame, text="Simulate",
+                                        command=self.run_simulation,
+                                        state=tk.DISABLED)
+            self._sim_btn.pack(fill=tk.X, pady=3)
+
+            self._progress_var = tk.IntVar(value=0)
+            self._progress_bar = ttk.Progressbar(sim_frame,
+                                                   variable=self._progress_var,
+                                                   maximum=100)
+            self._progress_bar.pack(fill=tk.X, pady=2)
+            self._sim_status = ttk.Label(sim_frame, text="")
+            self._sim_status.pack(fill=tk.X)
+
+            # -- Timeline Slider section --
+            slider_frame = ttk.LabelFrame(ctrl_inner, text="Timeline", padding=5)
+            slider_frame.pack(fill=tk.X, padx=5, pady=3)
+
+            self._slider_var = tk.IntVar(value=0)
+            self._slider = ttk.Scale(slider_frame, from_=0, to=0,
+                                      orient=tk.HORIZONTAL,
+                                      variable=self._slider_var,
+                                      command=self._on_slider_change)
+            self._slider.pack(fill=tk.X, pady=2)
+            self._slider.state(['disabled'])
+
+            self._slider_label = ttk.Label(slider_frame,
+                                            text="Run simulation first")
+            self._slider_label.pack(fill=tk.X)
+
+            # --- Right panel (plots) ---
+            right_frame = ttk.Frame(paned)
+            paned.add(right_frame, weight=1)
+
+            self.fig = Figure(figsize=(8, 8), dpi=100)
+            self.ax_toolpath = self.fig.add_subplot(211)
+            self.ax_heightmap = self.fig.add_subplot(212)
+            self.fig.tight_layout(pad=2.0)
+
+            self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
+            self.canvas.draw()
+            self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+            self._toolbar = NavigationToolbar2Tk(self.canvas, right_frame)
+            self._toolbar.update()
+
+            # Initial placeholder text
+            self.ax_toolpath.set_title("Toolpath (XY)")
+            self.ax_toolpath.text(0.5, 0.5, "Load a GCode file",
+                                  ha='center', va='center',
+                                  transform=self.ax_toolpath.transAxes,
+                                  fontsize=14, color='gray')
+            self.ax_heightmap.set_title("Material Removal")
+            self.ax_heightmap.text(0.5, 0.5, "Run simulation to see heightmap",
+                                    ha='center', va='center',
+                                    transform=self.ax_heightmap.transAxes,
+                                    fontsize=14, color='gray')
+            self.canvas.draw_idle()
+
+        def load_gcode(self):
+            """Open file dialog and load a GCode file."""
+            fname = filedialog.askopenfilename(
+                title="Open GCode File",
+                filetypes=[("GCode files", "*.nc *.gcode"), ("All files", "*.*")]
+            )
+            if fname:
+                self._load_file(fname)
+
+        def load_last_export(self):
+            """Load the last GCode file saved by the SVG Smoother tab."""
+            if (self.svg_smoother_tab and
+                    hasattr(self.svg_smoother_tab, '_last_saved_gcode') and
+                    self.svg_smoother_tab._last_saved_gcode):
+                path = self.svg_smoother_tab._last_saved_gcode
+                if os.path.exists(path):
+                    self._load_file(path)
+                    return
+            messagebox.showinfo("No Recent Export",
+                "No recently exported GCode file found.\n"
+                "Use 'Load GCode...' to browse for a file.")
+
+        def _load_file(self, filepath):
+            """Parse a GCode file and update the UI."""
+            try:
+                self.raw_lines, self.segments = sim_parse_gcode(filepath)
+            except Exception as e:
+                messagebox.showerror("Parse Error", f"Failed to parse GCode:\n{e}")
+                return
+
+            self.loaded_file = filepath
+            self.heightmap = None
+            self._file_label.config(
+                text=os.path.basename(filepath))
+            self._info_label.config(
+                text=f"{len(self.raw_lines)} lines, {len(self.segments)} segments")
+
+            # Parse header for stock dims and tool info
+            header = sim_parse_header(self.raw_lines)
+
+            # Auto-fill stock dimensions
+            if header.get('stock_dims'):
+                sd = header['stock_dims']
+                if header.get('plug_dims') and header.get('plug_x_offset'):
+                    # Joint file: compute total envelope
+                    pd = header['plug_dims']
+                    px = header['plug_x_offset']
+                    total_w = px + pd[0]
+                    total_h = max(sd[1], pd[1])
+                    total_t = max(sd[2], pd[2])
+                    self._stock_w_var.set(f"{total_w:.1f}")
+                    self._stock_h_var.set(f"{total_h:.1f}")
+                    self._stock_t_var.set(f"{total_t:.1f}")
+                else:
+                    self._stock_w_var.set(f"{sd[0]:.1f}")
+                    self._stock_h_var.set(f"{sd[1]:.1f}")
+                    self._stock_t_var.set(f"{sd[2]:.1f}")
+
+            # Resolve tools
+            self.tools_used = set(s.tool for s in self.segments if not s.is_rapid)
+            self._resolve_tools(header.get('tools', {}))
+            self._update_tools_display()
+
+            # Draw toolpath immediately
+            self._draw_toolpath()
+
+            # Enable simulate button
+            self._sim_btn.config(state=tk.NORMAL)
+            self._sim_status.config(text="Ready to simulate")
+
+        def _resolve_tools(self, header_tools):
+            """Determine tool diameters from available sources."""
+            tools = dict(SIM_DEFAULT_TOOLS)
+
+            # Override with coaster settings if available
+            try:
+                settings_path = os.path.expanduser(
+                    "~/.carvera_coaster_settings.json")
+                if os.path.exists(settings_path):
+                    import json
+                    with open(settings_path, 'r') as f:
+                        cfg = json.load(f)
+                    for key in ['tool_0', 'tool_1', 'tool_2']:
+                        prefix = key + "."
+                        tnum_key = prefix + "tool_num"
+                        dia_key = prefix + "diameter"
+                        if tnum_key in cfg and dia_key in cfg:
+                            tnum = int(cfg[tnum_key])
+                            dia = float(cfg[dia_key])
+                            existing = tools.get(tnum)
+                            color = existing.color if existing else (0.7, 0.7, 0.7)
+                            tools[tnum] = SimToolDef(
+                                tnum, dia, color, f'T{tnum} {dia:.3f}mm')
+            except Exception:
+                pass
+
+            # Override with GCode header (most specific)
+            for tnum, dia in header_tools.items():
+                existing = tools.get(tnum)
+                color = existing.color if existing else (0.7, 0.7, 0.7)
+                tools[tnum] = SimToolDef(tnum, dia, color, f'T{tnum} {dia:.3f}mm')
+
+            # Keep only tools used in this GCode
+            self.tool_defs = {k: v for k, v in tools.items()
+                              if k in self.tools_used}
+
+        def _update_tools_display(self):
+            """Update the tools section in the UI."""
+            for w in self._tools_frame.winfo_children():
+                w.destroy()
+            if not self.tool_defs:
+                ttk.Label(self._tools_frame, text="No tools found").pack()
+                return
+            for tnum in sorted(self.tool_defs.keys()):
+                td = self.tool_defs[tnum]
+                row = ttk.Frame(self._tools_frame)
+                row.pack(fill=tk.X, pady=1)
+                # Color swatch
+                c = td.color
+                hex_color = f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}"
+                swatch = tk.Canvas(row, width=14, height=14,
+                                    highlightthickness=0)
+                swatch.create_rectangle(1, 1, 13, 13, fill=hex_color,
+                                         outline='gray')
+                swatch.pack(side=tk.LEFT, padx=2)
+                ttk.Label(row, text=f"T{tnum}: {td.diameter_mm:.3f}mm").pack(
+                    side=tk.LEFT)
+
+        def _draw_toolpath(self):
+            """Draw 2D toolpath using LineCollection for performance."""
+            ax = self.ax_toolpath
+            ax.clear()
+            ax.set_aspect('equal')
+            ax.set_title('Toolpath (XY)')
+            ax.set_xlabel('X (mm)')
+            ax.set_ylabel('Y (mm)')
+
+            if not self.segments:
+                self.canvas.draw_idle()
+                return
+
+            # Group segments by (tool, is_rapid)
+            lines_by_group = {}
+            for seg in self.segments:
+                key = (seg.tool, seg.is_rapid)
+                lines_by_group.setdefault(key, []).append(
+                    [(seg.x0, seg.y0), (seg.x1, seg.y1)])
+
+            for (tool_num, is_rapid), lines in lines_by_group.items():
+                if is_rapid:
+                    lc = SimLineCollection(lines,
+                                            colors=[(0.5, 0.5, 0.5, 0.12)],
+                                            linewidths=0.3)
+                else:
+                    c = _TOOL_COLORS.get(tool_num, (0.7, 0.7, 0.7, 0.7))
+                    td = self.tool_defs.get(tool_num)
+                    if td:
+                        c = td.color + (0.7,) if len(td.color) == 3 else td.color
+                    lc = SimLineCollection(lines, colors=[c], linewidths=0.5)
+                ax.add_collection(lc)
+
+            # Stock outline
+            try:
+                w = float(self._stock_w_var.get())
+                h = float(self._stock_h_var.get())
+                ax.plot([0, w, w, 0, 0], [0, 0, h, h, 0],
+                        'k--', alpha=0.3, linewidth=1)
+            except ValueError:
+                pass
+
+            ax.autoscale_view()
+            ax.grid(True, alpha=0.2)
+            self.canvas.draw_idle()
+
+        def run_simulation(self):
+            """Launch material removal simulation in background thread."""
+            if not self.segments:
+                return
+            if self._sim_thread and self._sim_thread.is_alive():
+                self._sim_cancel = True
+                self._sim_thread.join(timeout=2.0)
+
+            try:
+                stock_w = float(self._stock_w_var.get())
+                stock_h = float(self._stock_h_var.get())
+                stock_t = float(self._stock_t_var.get())
+                resolution = float(self._res_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid Input",
+                    "Stock dimensions and resolution must be numbers.")
+                return
+
+            self.stock_dims = (stock_w, stock_h, stock_t)
+            self._sim_cancel = False
+            self._sim_btn.config(state=tk.DISABLED)
+            self._progress_var.set(0)
+            self._sim_status.config(text="Simulating...")
+            self._slider.state(['disabled'])
+
+            # Auto-size checkpoint count based on heightmap memory
+            hm_bytes = (int(stock_w / resolution) + 1) * (int(stock_h / resolution) + 1) * 4
+            max_mem = 500_000_000  # ~500MB budget for checkpoints
+            num_cp = min(200, max(20, max_mem // max(hm_bytes, 1)))
+
+            import threading, time
+            self._sim_start_time = time.time()
+
+            def worker():
+                result = sim_run(
+                    self.segments, stock_w, stock_h, stock_t,
+                    tools=self.tool_defs if self.tool_defs else None,
+                    resolution=resolution,
+                    progress_callback=lambda pct: self.after(
+                        0, self._on_sim_progress, pct),
+                    cancel_flag=lambda: self._sim_cancel,
+                    num_checkpoints=num_cp
+                )
+                self.after(0, self._on_sim_complete, result)
+
+            self._sim_thread = threading.Thread(target=worker, daemon=True)
+            self._sim_thread.start()
+
+        def _on_sim_progress(self, pct):
+            self._progress_var.set(pct)
+
+        def _on_sim_complete(self, result):
+            import time
+            elapsed = time.time() - self._sim_start_time
+            self._sim_btn.config(state=tk.NORMAL)
+            self._progress_var.set(100)
+
+            # Unpack result — (heightmap, checkpoints) tuple from checkpointed sim
+            if isinstance(result, tuple):
+                heightmap, checkpoints = result
+            else:
+                heightmap, checkpoints = result, []
+
+            if heightmap is None:
+                self._sim_status.config(text="Simulation cancelled")
+                return
+
+            self.heightmap = heightmap
+            self._checkpoints = checkpoints
+            grid_h, grid_w = heightmap.shape
+            self._sim_status.config(
+                text=f"Done in {elapsed:.1f}s  ({grid_w}x{grid_h} grid)")
+
+            # Enable timeline slider
+            if self._checkpoints:
+                n = len(self._checkpoints)
+                self._slider.config(from_=0, to=n - 1)
+                self._slider_var.set(n - 1)  # default to end
+                self._slider.state(['!disabled'])
+                total_segs = len(self.segments) if self.segments else 0
+                self._slider_label.config(
+                    text=f"Segment {total_segs}/{total_segs} (100%)")
+
+            self._draw_heightmap()
+
+        def _on_slider_change(self, value):
+            """Handle timeline slider movement — show checkpoint heightmap."""
+            if self._slider_updating or not self._checkpoints:
+                return
+            self._slider_updating = True
+            try:
+                idx = int(float(value))
+                idx = max(0, min(idx, len(self._checkpoints) - 1))
+                seg_idx, hm = self._checkpoints[idx]
+                total_segs = len(self.segments) if self.segments else 1
+                pct = int(100 * (seg_idx + 1) / total_segs)
+                self._slider_label.config(
+                    text=f"Segment {seg_idx + 1}/{total_segs} ({pct}%)")
+                # Fast in-place update if the image already exists
+                if self._hm_image is not None:
+                    self._hm_image.set_data(hm)
+                    self.canvas.draw_idle()
+                else:
+                    self._draw_heightmap(hm)
+            finally:
+                self._slider_updating = False
+
+        def _draw_heightmap(self, heightmap=None):
+            """Draw top-down heightmap using imshow with wood colormap.
+            If heightmap is None, uses self.heightmap (final result)."""
+            ax = self.ax_heightmap
+            ax.clear()
+            ax.set_aspect('equal')
+            ax.set_title('Material Removal (top-down)')
+            ax.set_xlabel('X (mm)')
+            ax.set_ylabel('Y (mm)')
+            self._hm_image = None
+
+            hm = heightmap if heightmap is not None else self.heightmap
+            if hm is None or self.stock_dims is None:
+                self.canvas.draw_idle()
+                return
+
+            stock_w, stock_h, stock_t = self.stock_dims
+            extent = [0, stock_w, 0, stock_h]
+
+            self._hm_image = ax.imshow(hm, origin='lower', extent=extent,
+                                        cmap=_WOOD_CMAP, vmin=0, vmax=stock_t,
+                                        interpolation='bilinear')
+
+            # Remove old colorbar if present, add new one
+            if self._colorbar is not None:
+                try:
+                    self._colorbar.remove()
+                except Exception:
+                    pass
+            self._colorbar = self.fig.colorbar(self._hm_image, ax=ax,
+                                                label='Height (mm)',
+                                                shrink=0.8)
+
+            self.fig.tight_layout(pad=2.0)
+            self.canvas.draw_idle()
 
 
 # =============================================================================
@@ -6608,12 +7391,23 @@ class CarveraUnifiedApp:
         self.notebook.add(self.level_tab, text="Level A-Axis")
         
         # SVG Smoother tab (utility - no hardware, green text)
+        self._utility_tabs = set()
         if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             self.svg_smoother_tab = SVGSmootherTab(self.notebook)
             self.notebook.add(self.svg_smoother_tab, text="SVG Smoother")
-            self._has_utility_tab = True
+            self._utility_tabs.add(str(self.svg_smoother_tab))
         else:
-            self._has_utility_tab = False
+            self.svg_smoother_tab = None
+
+        # GCode Simulator tab (utility - no hardware, green text)
+        if HAS_GCODE_SIM and HAS_MATPLOTLIB:
+            svg_ref = self.svg_smoother_tab if self.svg_smoother_tab else None
+            self.simulator_tab = GCodeSimulatorTab(self.notebook,
+                                                    svg_smoother_tab=svg_ref)
+            self.notebook.add(self.simulator_tab, text="GCode Simulator")
+            self._utility_tabs.add(str(self.simulator_tab))
+        else:
+            self.simulator_tab = None
         
         # Initialize pendant
         self.pendant = None
@@ -6625,15 +7419,12 @@ class CarveraUnifiedApp:
     def _on_tab_changed(self, event):
         """Update the tab type indicator when tab changes."""
         try:
-            current_tab = self.notebook.index(self.notebook.select())
-            tab_count = self.notebook.index("end")
-            
-            # Last tab (SVG Smoother) is software-only if it exists
-            if self._has_utility_tab and current_tab == tab_count - 1:
-                self._tab_type_label.config(text=" Software Only ", 
+            current_widget = self.notebook.select()
+            if current_widget in self._utility_tabs:
+                self._tab_type_label.config(text=" Software Only ",
                     bg="#a0e0a0", fg="#006000")
             else:
-                self._tab_type_label.config(text=" Hardware Control ", 
+                self._tab_type_label.config(text=" Hardware Control ",
                     bg="#a0c8f0", fg="#000080")
         except:
             pass
