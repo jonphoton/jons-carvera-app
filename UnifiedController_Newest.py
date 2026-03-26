@@ -4154,7 +4154,15 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 return None
 
         def _coaster_paths_to_shapely(machine_paths):
-            """Convert machine-coord polylines to Shapely Polygons with hole detection."""
+            """Convert machine-coord polylines to Shapely Polygons with nested
+            containment using the even-odd rule.
+
+            Builds a containment tree (each polygon's direct parent is the
+            smallest polygon that contains it).  Even nesting depth = cut
+            region (polygon exterior), odd depth = hole of parent.  This
+            correctly handles designs with three or more nesting levels,
+            e.g. rounded-rect > circle > arrows.
+            """
             polygons_raw = []
             for path in machine_paths:
                 if _svg_is_closed(path) and len(path) >= 4:
@@ -4163,24 +4171,52 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                         polygons_raw.append(poly)
             if not polygons_raw:
                 return []
-            # Sort by area descending for hole detection
+            # Sort by area descending so that when searching for the direct
+            # parent we can scan from smallest-larger to largest.
             polygons_raw.sort(key=lambda p: p.area, reverse=True)
+            n = len(polygons_raw)
+
+            # Build containment tree: for each polygon find its direct parent
+            # (the smallest polygon that contains it).  Since the list is
+            # sorted by descending area, scanning j from i-1 down to 0 finds
+            # the smallest container first.
+            parent = [None] * n
+            depth = [0] * n
+            for i in range(n):
+                for j in range(i - 1, -1, -1):
+                    if polygons_raw[j].contains(polygons_raw[i]):
+                        parent[i] = j
+                        depth[i] = depth[j] + 1
+                        break
+
+            # Collect direct children per node
+            children = [[] for _ in range(n)]
+            for i in range(n):
+                if parent[i] is not None:
+                    children[parent[i]].append(i)
+
+            # Even depth → cut region; its odd-depth direct children → holes
             result = []
-            used = set()
-            for i, outer in enumerate(polygons_raw):
-                if i in used:
-                    continue
-                holes = []
-                for j in range(i + 1, len(polygons_raw)):
-                    if j in used:
-                        continue
-                    if outer.contains(polygons_raw[j]):
-                        holes.append(list(polygons_raw[j].exterior.coords))
-                        used.add(j)
+            for i in range(n):
+                if depth[i] % 2 != 0:
+                    continue  # odd depth = hole, handled by parent
+                holes = [list(polygons_raw[c].exterior.coords)
+                         for c in children[i] if depth[c] % 2 == 1]
                 if holes:
-                    result.append(ShapelyPolygon(list(outer.exterior.coords), holes))
+                    try:
+                        poly = ShapelyPolygon(list(polygons_raw[i].exterior.coords), holes)
+                        if not poly.is_valid:
+                            poly = make_valid(poly)
+                        if poly.is_empty:
+                            continue
+                        if poly.geom_type == 'Polygon':
+                            result.append(poly)
+                        elif poly.geom_type == 'MultiPolygon':
+                            result.extend(p for p in poly.geoms if not p.is_empty)
+                    except Exception:
+                        result.append(polygons_raw[i])
                 else:
-                    result.append(outer)
+                    result.append(polygons_raw[i])
             return result
 
         def _coaster_circle_polygon(cx, cy, radius, n=360):
@@ -4495,6 +4531,95 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 "M2 ; program end",
             ]
 
+        def _coaster_estimate_gcode_time(gcode_text, rapid_rate=5000.0):
+            """Estimate cut time from GCode text.
+
+            Returns (total_seconds, phase_list) where phase_list is
+            [(phase_name, seconds), ...].
+            """
+            def _pw(line, letter):
+                m = re.search(rf'{letter}([+-]?[\d.]+)', line)
+                return float(m.group(1)) if m else None
+
+            x = y = z = 0.0
+            feed = 1000.0
+            total_time = 0.0
+            phases = []
+            cur_phase = "Setup"
+            phase_time = 0.0
+
+            for raw in gcode_text.split('\n'):
+                line = raw.strip()
+                if line.startswith('; === PHASE') or line.startswith('; === Final'):
+                    if cur_phase:
+                        phases.append((cur_phase, phase_time))
+                    cur_phase = line.strip('; =')
+                    phase_time = 0.0
+                    continue
+
+                if line.startswith('G0') or line.startswith('G1'):
+                    is_rapid = line.startswith('G0')
+                    nx, ny, nz = _pw(line, 'X'), _pw(line, 'Y'), _pw(line, 'Z')
+                    nf = _pw(line, 'F')
+                    if nf:
+                        feed = nf
+                    tx = nx if nx is not None else x
+                    ty = ny if ny is not None else y
+                    tz = nz if nz is not None else z
+                    dist = math.sqrt((tx - x)**2 + (ty - y)**2 + (tz - z)**2)
+                    if is_rapid:
+                        t = dist / rapid_rate * 60.0
+                    else:
+                        t = dist / max(feed, 1.0) * 60.0
+                    total_time += t
+                    phase_time += t
+                    x, y, z = tx, ty, tz
+                elif line.startswith('G2') or line.startswith('G3'):
+                    nx, ny, nz = _pw(line, 'X'), _pw(line, 'Y'), _pw(line, 'Z')
+                    ni, nj = _pw(line, 'I'), _pw(line, 'J')
+                    nf = _pw(line, 'F')
+                    if nf:
+                        feed = nf
+                    tx = nx if nx is not None else x
+                    ty = ny if ny is not None else y
+                    tz = nz if nz is not None else z
+                    ii = ni if ni is not None else 0.0
+                    jj = nj if nj is not None else 0.0
+                    r = math.sqrt(ii**2 + jj**2)
+                    if r > 0.001:
+                        ca = x + ii
+                        cb = y + jj
+                        a0 = math.atan2(y - cb, x - ca)
+                        a1 = math.atan2(ty - cb, tx - ca)
+                        da = abs(a1 - a0)
+                        if da < 0.01:
+                            da = 2.0 * math.pi
+                        arc_len = r * da
+                    else:
+                        arc_len = math.sqrt((tx - x)**2 + (ty - y)**2)
+                    dz = abs(tz - z)
+                    dist = math.sqrt(arc_len**2 + dz**2)
+                    t = dist / max(feed, 1.0) * 60.0
+                    total_time += t
+                    phase_time += t
+                    x, y, z = tx, ty, tz
+
+            if cur_phase:
+                phases.append((cur_phase, phase_time))
+            return total_time, phases
+
+        def _coaster_format_time(seconds):
+            """Format seconds as human-readable time string."""
+            if seconds < 60:
+                return f"{seconds:.0f}s"
+            m = int(seconds) // 60
+            s = int(seconds) % 60
+            if m < 60:
+                return f"{m}m {s:02d}s"
+            h = m // 60
+            m = m % 60
+            return f"{h}h {m:02d}m"
+
         def _coaster_gcode_tool_change(tool_number, rpm, retract_z):
             """GCode tool change sequence."""
             return [
@@ -4547,48 +4672,34 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                                                ramp_on_path=False):
             """Convert 2D passes to GCode at a fixed Z depth.
 
-            Uses a helical ramp entry for the first pass, then traverses
-            between subsequent passes at a safe height above the stock
-            surface (z_top) to avoid dragging through uncut material.
+            Always uses ramp-on-path entry: the first pass descends
+            gradually along the cutting path itself.  This keeps the tool
+            within the polygon boundary — a helical ramp at the first raster
+            pass would extend below the polygon edge (the first pass is at
+            the very bottom of the pocket, only stepover/2 from the boundary,
+            while the ramp circle sweeps ramp_radius + tool_r in all
+            directions).
 
-            If ramp_on_path=True, the first pass descends gradually along
-            the path itself instead of using a separate helical/linear ramp.
-            Use this for contour-only operations (like clearance passes)
-            where there is no prior clearing and a separate ramp would cut
-            through unintended material.
+            Between subsequent passes, stays at cutting depth when the next
+            pass start is within one tool diameter (safe because stepover
+            < 100% means the tool already cleared the traverse region).
+            Falls back to lift/rapid/plunge for distant passes.
             """
             if ramp_feed is None:
                 ramp_feed = feedrate / 3.0
             lines = []
             ramp_from = prev_z if prev_z is not None else retract_z
             ramp_done = False
-            ramp_radius = tool_diameter * 0.4  # slightly less than tool radius
-            tool_r = tool_diameter / 2.0
-            # Auto-enable ramp_on_path for small tools that would hit the
-            # linear ramp fallback — the linear ramp extends 6mm in +X from
-            # the path midpoint, which can cut through unintended areas
-            if ramp_radius < 0.3:
-                ramp_on_path = True
-            # Auto-enable ramp_on_path when the first pass is too short for
-            # the helical ramp circle to fit.  The ramp sweeps a circle of
-            # radius (ramp_radius + tool_r) around the midpoint.  If the pass
-            # is shorter than the ramp diameter, the ramp circle extends
-            # beyond the pocket boundary at narrow features (dragon feet etc.)
-            if not ramp_on_path and passes_2d:
-                first_pts = np.asarray(passes_2d[0])
-                if len(first_pts) >= 2:
-                    first_len = np.linalg.norm(first_pts[-1] - first_pts[0])
-                    if first_len < 2 * (ramp_radius + tool_r):
-                        ramp_on_path = True
             # Traverse above the stock surface to avoid gouging uncut material
             traverse_z = (z_top + 1.0) if z_top is not None else retract_z
+            last_end = None  # end point of previous pass for stay-down check
             for pss in passes_2d:
                 pts = np.asarray(pss)
                 if len(pts) < 2:
                     continue
-                if not ramp_done and ramp_on_path:
+                if not ramp_done:
                     # Ramp along the path: descend gradually while following
-                    # the path instead of a separate helical/linear ramp
+                    # the first pass instead of a separate helical ramp.
                     lines.append(f"G0 Z{retract_z:.3f}")
                     lines.append(f"G0 X{pts[0][0]:.4f} Y{pts[0][1]:.4f}")
                     lines.append(f"G0 Z{ramp_from + 0.3:.3f}")
@@ -4606,23 +4717,36 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                             lines.append(f"G1 X{pts[j][0]:.4f} Y{pts[j][1]:.4f} Z{z:.3f} F{ramp_feed:.0f}")
                         else:
                             lines.append(f"G1 X{pts[j][0]:.4f} Y{pts[j][1]:.4f} F{feedrate:.0f}")
+                    # Return over the ramp area at full depth to ensure
+                    # complete coverage — the gradual descent left the
+                    # start of the pass at intermediate Z.
+                    lines.append(f"G1 X{pts[0][0]:.4f} Y{pts[0][1]:.4f} Z{z_depth:.3f} F{feedrate:.0f}")
+                    lines.append(f"G1 X{pts[-1][0]:.4f} Y{pts[-1][1]:.4f} F{feedrate:.0f}")
+                    last_end = pts[-1].copy()
                     ramp_done = True
                     continue
-                if not ramp_done:
-                    # Helical ramp entry at the midpoint of the first pass
-                    lines.append(f"G0 Z{retract_z:.3f}")
-                    mid_idx = len(pts) // 2
-                    ramp_cx, ramp_cy = pts[mid_idx][0], pts[mid_idx][1]
-                    lines.extend(_coaster_gcode_helical_ramp(
-                        ramp_cx, ramp_cy, ramp_radius,
-                        ramp_from, z_depth, stepdown, ramp_feed))
-                    ramp_done = True
-                # Lift to shallow clearance, rapid to pass start, plunge
-                lines.append(f"G0 Z{traverse_z:.3f}")
-                lines.append(f"G0 X{pts[0][0]:.4f} Y{pts[0][1]:.4f}")
-                lines.append(f"G1 Z{z_depth:.3f} F{ramp_feed:.0f}")
+                # Stay at cutting depth when next pass is close (within tool
+                # diameter).  With stepover < 100%, the tool already cleared
+                # the intervening strip so the traverse is through air.
+                if last_end is not None:
+                    traverse_dist = math.sqrt(
+                        (pts[0][0] - last_end[0])**2 + (pts[0][1] - last_end[1])**2)
+                    if traverse_dist <= tool_diameter:
+                        # Stay down — feed directly to next pass start
+                        lines.append(f"G1 X{pts[0][0]:.4f} Y{pts[0][1]:.4f} F{feedrate:.0f}")
+                    else:
+                        # Far apart — lift, rapid, plunge
+                        lines.append(f"G0 Z{traverse_z:.3f}")
+                        lines.append(f"G0 X{pts[0][0]:.4f} Y{pts[0][1]:.4f}")
+                        lines.append(f"G1 Z{z_depth:.3f} F{ramp_feed:.0f}")
+                else:
+                    # First pass after ramp — must lift and position
+                    lines.append(f"G0 Z{traverse_z:.3f}")
+                    lines.append(f"G0 X{pts[0][0]:.4f} Y{pts[0][1]:.4f}")
+                    lines.append(f"G1 Z{z_depth:.3f} F{ramp_feed:.0f}")
                 for pt in pts[1:]:
                     lines.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} F{feedrate:.0f}")
+                last_end = pts[-1].copy()
             return lines
 
         def _coaster_gcode_surface_at_depth(passes_2d, z_depth, feedrate, retract_z,
@@ -4884,7 +5008,16 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
 
             lines.append("")
             lines.extend(_coaster_gcode_footer(retract_z))
-            return "\n".join(lines)
+            gcode = "\n".join(lines)
+            total_sec, phases = _coaster_estimate_gcode_time(gcode)
+            time_lines = [f"; Estimated cut time: {_coaster_format_time(total_sec)}"]
+            for pname, psec in phases:
+                if psec > 0.5:
+                    time_lines.append(f";   {pname}: {_coaster_format_time(psec)}")
+            time_lines.append("")
+            first_nl = gcode.index('\n')
+            gcode = gcode[:first_nl + 1] + "\n".join(time_lines) + "\n" + gcode[first_nl + 1:]
+            return gcode
 
         def _coaster_generate_plug_gcode(params):
             """Generate complete plug GCode.
@@ -4993,7 +5126,16 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
 
             lines.append("")
             lines.extend(_coaster_gcode_footer(retract_z))
-            return "\n".join(lines)
+            gcode = "\n".join(lines)
+            total_sec, phases = _coaster_estimate_gcode_time(gcode)
+            time_lines = [f"; Estimated cut time: {_coaster_format_time(total_sec)}"]
+            for pname, psec in phases:
+                if psec > 0.5:
+                    time_lines.append(f";   {pname}: {_coaster_format_time(psec)}")
+            time_lines.append("")
+            first_nl = gcode.index('\n')
+            gcode = gcode[:first_nl + 1] + "\n".join(time_lines) + "\n" + gcode[first_nl + 1:]
+            return gcode
 
         def _coaster_generate_joint_gcode(params):
             """Generate joint GCode for both coaster and plug in one file.
@@ -5177,7 +5319,18 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
 
             lines.append("")
             lines.extend(_coaster_gcode_footer(retract_z))
-            return "\n".join(lines)
+            gcode = "\n".join(lines)
+            # Embed time estimate in GCode header
+            total_sec, phases = _coaster_estimate_gcode_time(gcode)
+            time_lines = [f"; Estimated cut time: {_coaster_format_time(total_sec)}"]
+            for pname, psec in phases:
+                if psec > 0.5:
+                    time_lines.append(f";   {pname}: {_coaster_format_time(psec)}")
+            time_lines.append("")
+            # Insert after the first line (title comment)
+            first_nl = gcode.index('\n')
+            gcode = gcode[:first_nl + 1] + "\n".join(time_lines) + "\n" + gcode[first_nl + 1:]
+            return gcode
 
         def _coaster_generate_clearance_gcode(params):
             """Generate inlay clearance pass GCode.
@@ -6170,11 +6323,12 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             """Build clickable inlay regions from fitted paths.
 
             Each closed contour becomes its own independently selectable
-            region. Polygon hierarchy (holes) is handled later at GCode
-            generation time, not at the selection stage.
+            region. Containment relationships are precomputed here so
+            draw-time highlighting is fast.
             """
             self._selectable_regions = []
             self._selected_indices = set()
+            self._region_children = {}  # parent_idx -> [child_idx, ...]
             if not self.results or not self.results.get("fitted"):
                 return
             if not HAS_SHAPELY:
@@ -6189,6 +6343,22 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                                 "polygon": poly,
                                 "members": [(pg_idx, c_idx)],
                             })
+            # Precompute containment: for each region, find which smaller
+            # regions are inside it (relaxed check handles boundary touching)
+            n = len(self._selectable_regions)
+            from shapely.prepared import prep as shapely_prep
+            for i in range(n):
+                outer = self._selectable_regions[i]["polygon"]
+                outer_prep = shapely_prep(outer.buffer(0.1))
+                children = []
+                for j in range(n):
+                    if j == i:
+                        continue
+                    inner = self._selectable_regions[j]["polygon"]
+                    if inner.area < outer.area and outer_prep.contains(inner):
+                        children.append(j)
+                if children:
+                    self._region_children[i] = children
 
         def _handle_plot_click(self, event):
             """Handle click on the plot to select/deselect inlay regions."""
@@ -6218,39 +6388,58 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
         def _draw_selected_regions(self):
             """Draw filled highlight for selected inlay regions.
 
-            For each selected polygon, any other closed paths contained
-            within it are subtracted as holes so letters like 'O' display
-            correctly as a ring rather than a solid disk.
+            For each selected polygon, unselected inner regions are
+            subtracted so they don't appear highlighted until the user
+            explicitly clicks them.  Uses precomputed containment from
+            _build_selectable_regions() for fast lookups.
             """
             if not HAS_SHAPELY or not self._selectable_regions:
                 return
-            from matplotlib.patches import PathPatch
-            from matplotlib.path import Path as MplPath
 
             for i in self._selected_indices:
                 poly = self._selectable_regions[i]["polygon"]
-                # Find contained inner paths to treat as holes
-                holes = []
-                for j, other in enumerate(self._selectable_regions):
-                    if j == i:
-                        continue
-                    if poly.contains(other["polygon"]):
-                        holes.append(other["polygon"])
-                # Build a matplotlib Path with holes
+                # Subtract unselected children as holes
+                fill_poly = poly
+                for j in self._region_children.get(i, []):
+                    if j not in self._selected_indices:
+                        try:
+                            fill_poly = fill_poly.difference(
+                                self._selectable_regions[j]["polygon"])
+                        except Exception:
+                            pass
+                self._draw_shapely_patch(fill_poly, self.ax,
+                                          facecolor='cyan', alpha=0.3,
+                                          edgecolor='cyan', linewidth=2)
+
+        def _draw_shapely_patch(self, geom, ax, **kwargs):
+            """Draw a Shapely polygon (with holes) as a matplotlib patch."""
+            from matplotlib.patches import PathPatch
+            from matplotlib.path import Path as MplPath
+
+            if geom is None or geom.is_empty:
+                return
+            polys = []
+            if geom.geom_type == 'Polygon':
+                polys = [geom]
+            elif geom.geom_type == 'MultiPolygon':
+                polys = list(geom.geoms)
+            elif geom.geom_type == 'GeometryCollection':
+                polys = [g for g in geom.geoms
+                         if g.geom_type == 'Polygon' and not g.is_empty]
+            for poly in polys:
                 verts = list(poly.exterior.coords)
                 codes = ([MplPath.MOVETO] +
                          [MplPath.LINETO] * (len(verts) - 2) +
                          [MplPath.CLOSEPOLY])
-                for hole_poly in holes:
-                    hcoords = list(hole_poly.exterior.coords)
+                for interior in poly.interiors:
+                    hcoords = list(interior.coords)
                     verts.extend(hcoords)
                     codes.extend([MplPath.MOVETO] +
                                  [MplPath.LINETO] * (len(hcoords) - 2) +
                                  [MplPath.CLOSEPOLY])
                 path = MplPath(verts, codes)
-                patch = PathPatch(path, facecolor='cyan', alpha=0.3,
-                                  edgecolor='cyan', linewidth=2)
-                self.ax.add_patch(patch)
+                patch = PathPatch(path, **kwargs)
+                ax.add_patch(patch)
 
         def _get_selected_fitted_paths(self):
             """Return fitted paths filtered to selected inlay regions.
@@ -6420,9 +6609,15 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             with open(outfile, 'w') as f:
                 f.write(gcode)
             n_lines = gcode.count('\n') + 1
-            self.gcode_status.config(text=f"Coaster GCode saved: {n_lines} lines")
+            total_sec, phases = _coaster_estimate_gcode_time(gcode)
+            time_str = _coaster_format_time(total_sec)
+            self.gcode_status.config(text=f"Coaster GCode saved: {n_lines} lines, est. {time_str}")
             self._last_saved_gcode = outfile
-            messagebox.showinfo("GCode Saved", f"Coaster GCode saved to:\n{outfile}")
+            phase_lines = "\n".join(
+                f"  {name}: {_coaster_format_time(sec)}" for name, sec in phases if sec > 0.5)
+            messagebox.showinfo("GCode Saved",
+                f"Coaster GCode saved to:\n{outfile}\n\n"
+                f"Estimated cut time: {time_str}\n{phase_lines}")
 
         def generate_plug_gcode(self):
             """Button handler: generate and save plug GCode."""
@@ -6467,9 +6662,15 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             with open(outfile, 'w') as f:
                 f.write(gcode)
             n_lines = gcode.count('\n') + 1
-            self.gcode_status.config(text=f"Plug GCode saved: {n_lines} lines")
+            total_sec, phases = _coaster_estimate_gcode_time(gcode)
+            time_str = _coaster_format_time(total_sec)
+            self.gcode_status.config(text=f"Plug GCode saved: {n_lines} lines, est. {time_str}")
             self._last_saved_gcode = outfile
-            messagebox.showinfo("GCode Saved", f"Plug GCode saved to:\n{outfile}")
+            phase_lines = "\n".join(
+                f"  {name}: {_coaster_format_time(sec)}" for name, sec in phases if sec > 0.5)
+            messagebox.showinfo("GCode Saved",
+                f"Plug GCode saved to:\n{outfile}\n\n"
+                f"Estimated cut time: {time_str}\n{phase_lines}")
 
         def generate_joint_gcode(self):
             """Button handler: generate and save joint coaster+plug GCode."""
@@ -6533,9 +6734,16 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             with open(outfile, 'w') as f:
                 f.write(gcode)
             n_lines = gcode.count('\n') + 1
-            self.gcode_status.config(text=f"Joint GCode saved: {n_lines} lines")
+            # Estimate cut time and show breakdown
+            total_sec, phases = _coaster_estimate_gcode_time(gcode)
+            time_str = _coaster_format_time(total_sec)
+            self.gcode_status.config(text=f"Joint GCode saved: {n_lines} lines, est. {time_str}")
             self._last_saved_gcode = outfile
-            messagebox.showinfo("GCode Saved", f"Joint GCode saved to:\n{outfile}")
+            phase_lines = "\n".join(
+                f"  {name}: {_coaster_format_time(sec)}" for name, sec in phases if sec > 0.5)
+            messagebox.showinfo("GCode Saved",
+                f"Joint GCode saved to:\n{outfile}\n\n"
+                f"Estimated cut time: {time_str}\n{phase_lines}")
 
         def generate_clearance_gcode(self):
             """Button handler: generate and save inlay clearance pass GCode."""
