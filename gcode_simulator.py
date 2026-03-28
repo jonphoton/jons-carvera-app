@@ -77,6 +77,7 @@ def parse_gcode(filepath):
     for line_idx, raw in enumerate(raw_lines):
         line = raw.split(';')[0].strip().upper()
         if not line: continue
+        if 'G53' in line: continue  # machine-coordinate move, not work coords
         tc = re.search(r'M6\s*T(\d+)', line)
         if tc: current_tool = int(tc.group(1)); continue
         tc2 = re.search(r'T(\d+)\s*M6', line)

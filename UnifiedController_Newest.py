@@ -4528,6 +4528,7 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 "M5 ; spindle off",
                 f"G0 Z{retract_z:.3f}",
                 "G0 X0 Y0",
+                "G53 G0 Z-5.000 ; retract Z in machine coords",
                 "M2 ; program end",
             ]
 
@@ -4556,6 +4557,8 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                     cur_phase = line.strip('; =')
                     phase_time = 0.0
                     continue
+                if 'G53' in line:
+                    continue  # machine-coordinate move, skip
 
                 if line.startswith('G0') or line.startswith('G1'):
                     is_rapid = line.startswith('G0')
@@ -5553,12 +5556,15 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
             self._svg_pos_y_var = tk.StringVar(value="")
             self._svg_transform_timer = None
 
-            # Drag state
+            # Drag state (right-click drag for SVG position)
             self._drag_start_pixel = None
             self._drag_start_pos = None
             self._dragged = False
             self._drag_dpx = 1.0  # data units per pixel (frozen at drag start)
             self._drag_dpy = 1.0
+            # Selection rectangle state (left-click drag)
+            self._sel_rect_start = None   # (xdata, ydata) in data coords
+            self._sel_rect_patch = None   # matplotlib Rectangle patch
 
             # Coaster parameter variables (set defaults, then override from saved)
             self.coaster_diameter_var = tk.StringVar(value=str(COASTER_DEFAULT_DIAMETER))
@@ -6150,63 +6156,109 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
         # --- Drag and click handlers ---
 
         def _on_mouse_press(self, event):
-            if event.inaxes != self.ax or event.button != 1:
+            if event.inaxes != self.ax:
                 return
             if self._toolbar.mode:
                 return
-            self._drag_start_pixel = (event.x, event.y)
-            try:
-                self._drag_start_pos = (float(self._svg_pos_x_var.get()),
-                                         float(self._svg_pos_y_var.get()))
-            except (ValueError, tk.TclError):
-                self._drag_start_pixel = None
-                return
-            self._dragged = False
-            # Freeze pixel-to-data conversion at drag start
-            inv = self.ax.transData.inverted()
-            p0 = inv.transform((0, 0))
-            p1 = inv.transform((100, 0))
-            p2 = inv.transform((0, 100))
-            self._drag_dpx = (p1[0] - p0[0]) / 100.0
-            self._drag_dpy = (p2[1] - p0[1]) / 100.0
+            if event.button == 3:
+                # Right-click: start SVG position drag
+                self._drag_start_pixel = (event.x, event.y)
+                try:
+                    self._drag_start_pos = (float(self._svg_pos_x_var.get()),
+                                             float(self._svg_pos_y_var.get()))
+                except (ValueError, tk.TclError):
+                    self._drag_start_pixel = None
+                    return
+                self._dragged = False
+                inv = self.ax.transData.inverted()
+                p0 = inv.transform((0, 0))
+                p1 = inv.transform((100, 0))
+                p2 = inv.transform((0, 100))
+                self._drag_dpx = (p1[0] - p0[0]) / 100.0
+                self._drag_dpy = (p2[1] - p0[1]) / 100.0
+            elif event.button == 1:
+                # Left-click: start selection rectangle (or single click)
+                self._sel_rect_start = (event.xdata, event.ydata)
+                self._drag_start_pixel = (event.x, event.y)
+                self._dragged = False
 
         def _on_mouse_motion(self, event):
-            if self._drag_start_pixel is None:
-                return
             if event.x is None or event.y is None:
                 return
-            px_dx = event.x - self._drag_start_pixel[0]
-            px_dy = event.y - self._drag_start_pixel[1]
-            if not self._dragged:
-                if abs(px_dx) < 4 and abs(px_dy) < 4:
-                    return
-                self._dragged = True
-            data_dx = px_dx * self._drag_dpx
-            data_dy = px_dy * self._drag_dpy
-            new_x = self._drag_start_pos[0] + data_dx
-            new_y = self._drag_start_pos[1] + data_dy
-            self._svg_pos_x_var.set(f"{new_x:.2f}")
-            self._svg_pos_y_var.set(f"{new_y:.2f}")
-            # Debounced reprocess during drag
-            if self._svg_transform_timer is not None:
-                self.after_cancel(self._svg_transform_timer)
-            self._svg_transform_timer = self.after(50, self._do_svg_transform_update)
-
-        def _on_mouse_release(self, event):
-            if self._drag_start_pixel is None:
-                return
-            was_dragged = self._dragged
-            self._drag_start_pixel = None
-            self._dragged = False
-            if was_dragged:
-                # Cancel pending debounced update and do immediate reprocess
+            # Right-drag: move SVG position
+            if self._drag_start_pos is not None and self._drag_start_pixel is not None:
+                px_dx = event.x - self._drag_start_pixel[0]
+                px_dy = event.y - self._drag_start_pixel[1]
+                if not self._dragged:
+                    if abs(px_dx) < 4 and abs(px_dy) < 4:
+                        return
+                    self._dragged = True
+                data_dx = px_dx * self._drag_dpx
+                data_dy = px_dy * self._drag_dpy
+                new_x = self._drag_start_pos[0] + data_dx
+                new_y = self._drag_start_pos[1] + data_dy
+                self._svg_pos_x_var.set(f"{new_x:.2f}")
+                self._svg_pos_y_var.set(f"{new_y:.2f}")
                 if self._svg_transform_timer is not None:
                     self.after_cancel(self._svg_transform_timer)
-                    self._svg_transform_timer = None
-                self.run_processing()
-            else:
-                # Click — dispatch to selection handler
-                self._handle_plot_click(event)
+                self._svg_transform_timer = self.after(50, self._do_svg_transform_update)
+                return
+            # Left-drag: selection rectangle
+            if self._sel_rect_start is not None and self._drag_start_pixel is not None:
+                if event.inaxes != self.ax:
+                    return
+                px_dx = event.x - self._drag_start_pixel[0]
+                px_dy = event.y - self._drag_start_pixel[1]
+                if not self._dragged:
+                    if abs(px_dx) < 4 and abs(px_dy) < 4:
+                        return
+                    self._dragged = True
+                x0, y0 = self._sel_rect_start
+                x1, y1 = event.xdata, event.ydata
+                rx, ry = min(x0, x1), min(y0, y1)
+                rw, rh = abs(x1 - x0), abs(y1 - y0)
+                if self._sel_rect_patch is not None:
+                    self._sel_rect_patch.set_xy((rx, ry))
+                    self._sel_rect_patch.set_width(rw)
+                    self._sel_rect_patch.set_height(rh)
+                else:
+                    from matplotlib.patches import Rectangle
+                    self._sel_rect_patch = Rectangle(
+                        (rx, ry), rw, rh,
+                        linewidth=1.5, edgecolor='cyan', facecolor='cyan',
+                        alpha=0.15, linestyle='--', zorder=10)
+                    self.ax.add_patch(self._sel_rect_patch)
+                self.canvas.draw_idle()
+
+        def _on_mouse_release(self, event):
+            # Right-drag release: finalize SVG position
+            if self._drag_start_pos is not None:
+                was_dragged = self._dragged
+                self._drag_start_pixel = None
+                self._drag_start_pos = None
+                self._dragged = False
+                if was_dragged:
+                    if self._svg_transform_timer is not None:
+                        self.after_cancel(self._svg_transform_timer)
+                        self._svg_transform_timer = None
+                    self.run_processing()
+                return
+            # Left release: selection rect or single click
+            if self._sel_rect_start is not None:
+                was_dragged = self._dragged
+                if self._sel_rect_patch is not None:
+                    self._sel_rect_patch.remove()
+                    self._sel_rect_patch = None
+                if was_dragged and event.inaxes == self.ax:
+                    x0, y0 = self._sel_rect_start
+                    x1, y1 = event.xdata, event.ydata
+                    self._select_regions_in_rect(
+                        min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+                elif not was_dragged:
+                    self._handle_plot_click(event)
+                self._sel_rect_start = None
+                self._drag_start_pixel = None
+                self._dragged = False
 
         def plot_results(self):
             self.ax.clear()
@@ -6384,6 +6436,18 @@ if HAS_SVG_SMOOTHER and HAS_MATPLOTLIB:
                 else:
                     self._selected_indices.add(best)
                 self.plot_results()
+
+        def _select_regions_in_rect(self, xmin, ymin, xmax, ymax):
+            """Select all regions whose polygons intersect the given rectangle."""
+            if not self._selectable_regions:
+                return
+            from shapely.geometry import box as shapely_box
+            rect_poly = shapely_box(xmin, ymin, xmax, ymax)
+            self._selected_indices = set()
+            for i, region in enumerate(self._selectable_regions):
+                if region["polygon"].intersects(rect_poly):
+                    self._selected_indices.add(i)
+            self.plot_results()
 
         def _draw_selected_regions(self):
             """Draw filled highlight for selected inlay regions.
